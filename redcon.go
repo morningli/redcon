@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -188,7 +189,7 @@ func (r *Request) SetContext(v interface{}) { r.ctx = v }
 func (r *Request) WriteArray(count int)     { AppendArray(r.Raw, count) }
 func (r *Request) WriteBulk(bulk []byte) {
 	v := AppendBulk(r.Raw, bulk)
-	r.Args = append(r.Args, v)
+	r.Args = append(r.Args, v.Data)
 }
 func (r *Request) WriteRaw(data []byte) { _, _ = r.Raw.Write(data) }
 
@@ -214,6 +215,8 @@ type Server struct {
 // Respond allows for writing RESP messages.
 type Respond struct {
 	*Buffer
+	resp  RESP
+	stack []*RESP // 追踪嵌套 Array 的栈
 }
 
 // NewRespond creates a new RESP writer.
@@ -221,38 +224,9 @@ func NewRespond() *Respond {
 	return &Respond{Buffer: NewBuffer()}
 }
 
-func (r *Respond) RespType() Type {
-	return GetType(r.Buffer)
-}
-
-func (r *Respond) GetArrayLength() (int, error) {
-	return GetArrayLength(r.Buffer)
-}
-
-// WriteNull writes a null to the client
-func (r *Respond) WriteNull() {
-	AppendNull(r.Buffer)
-}
-
-// WriteArray writes an array header. You must then write additional
-// sub-responses to the client to complete the response.
-// For example to write two strings:
-//
-//	c.WriteArray(2)
-//	c.WriteBulkString("item 1")
-//	c.WriteBulkString("item 2")
-func (r *Respond) WriteArray(count int) {
-	AppendArray(r.Buffer, count)
-}
-
-// WriteBulk writes bulk bytes to the client.
-func (r *Respond) WriteBulk(bulk []byte) *BufferView {
-	return AppendBulk(r.Buffer, bulk)
-}
-
-// WriteBulkString writes a bulk string to the client.
-func (r *Respond) WriteBulkString(bulk string) {
-	AppendBulkString(r.Buffer, bulk)
+// GetRESP 返回当前维护的逻辑结构
+func (r *Respond) GetRESP() RESP {
+	return r.resp
 }
 
 // Data returns the unflushed buffer. This is a copy so changes
@@ -265,14 +239,222 @@ func (r *Respond) Bytes() []byte {
 	return r.Buffer.Bytes()
 }
 
+// ReadRESP 从 rd 中读取下一个完整的 RESP 报文。
+// 仅在 Buffer 为空时有效，解析结果填充 Buffer 并维护内部 RESP 结构。
+func (r *Respond) ReadRESP(rd io.Reader) error {
+	if r.Buffer.Len() > 0 {
+		return errors.New("ReadRESP: buffer must be empty")
+	}
+
+	resp, err := r.decodeStream(rd)
+	if err != nil {
+		return err
+	}
+
+	r.resp = resp
+	return nil
+}
+
+func (r *Respond) decodeStream(rd io.Reader) (RESP, error) {
+	// 1. 读取前缀
+	start := r.Buffer.Len()
+	prefixBuf := make([]byte, 1)
+	if _, err := io.ReadFull(rd, prefixBuf); err != nil {
+		return RESP{}, err
+	}
+	r.Buffer.Write(prefixBuf)
+
+	prefix := Type(prefixBuf[0])
+	resp := RESP{Type: prefix}
+
+	switch prefix {
+	case String, Error, Integer:
+		// 2. 读取到行尾，获取视图
+		lineView, err := r.readUntilCRLF(rd)
+		if err != nil {
+			return RESP{}, err
+		}
+		// 整体 Raw 包含前缀
+		resp.Raw = r.Buffer.Slice(start, r.Buffer.Len())
+		// Data 为排除前缀和末尾 \r\n 的视图
+		resp.Data = lineView.Slice(0, lineView.Len()-2)
+		return resp, nil
+
+	case Bulk:
+		// 1. 读取长度行视图
+		lenLineView, err := r.readUntilCRLF(rd)
+		if err != nil {
+			return RESP{}, err
+		}
+
+		// 解析长度 (利用 BufferView 的 Bytes() 临时转 string 转换，或直接解析 ASCII)
+		n, err := strconv.Atoi(string(lenLineView.Slice(0, lenLineView.Len()-2).Bytes()))
+		if err != nil {
+			return RESP{}, err
+		}
+		resp.Count = n
+
+		if n == -1 { // Null Bulk String "$-1\r\n"
+			resp.Raw = r.Buffer.Slice(start, r.Buffer.Len())
+			return resp, nil
+		}
+
+		// 2. 读取主体数据 n + 2 字节 (\r\n)
+		dataStart := r.Buffer.Len()
+		// 使用适配器流式灌入物理 Buffer
+		if _, err := io.CopyN(r.Buffer, rd, int64(n+2)); err != nil {
+			return RESP{}, err
+		}
+
+		resp.Data = r.Buffer.Slice(dataStart, dataStart+n)
+		resp.Raw = r.Buffer.Slice(start, r.Buffer.Len())
+		return resp, nil
+
+	case Array:
+		// 1. 读取数量行视图
+		countLineView, err := r.readUntilCRLF(rd)
+		if err != nil {
+			return RESP{}, err
+		}
+		count, err := strconv.Atoi(string(countLineView.Slice(0, countLineView.Len()-2).Bytes()))
+		if err != nil {
+			return RESP{}, err
+		}
+		resp.Count = count
+
+		if count <= 0 { // *0\r\n 或 *-1\r\n
+			resp.Raw = r.Buffer.Slice(start, r.Buffer.Len())
+			return resp, nil
+		}
+
+		// 2. 递归读取子元素
+		resp.Array = make([]RESP, 0, count)
+		for i := 0; i < count; i++ {
+			subResp, err := r.decodeStream(rd)
+			if err != nil {
+				return RESP{}, err
+			}
+			resp.Array = append(resp.Array, subResp)
+		}
+
+		resp.Raw = r.Buffer.Slice(start, r.Buffer.Len())
+		return resp, nil
+
+	default:
+		return RESP{}, fmt.Errorf("invalid resp type: %c", prefix)
+	}
+}
+
+// readUntilCRLF 从 rd 读取数据直到 \r\n，同步写入物理 Buffer，并返回这一行的视图。
+func (r *Respond) readUntilCRLF(rd io.Reader) (*BufferView, error) {
+	start := r.Buffer.Len()
+	var lastByte byte
+	currByte := make([]byte, 1)
+
+	for {
+		_, err := io.ReadFull(rd, currByte)
+		if err != nil {
+			return nil, err
+		}
+
+		// 写入物理 Buffer (内存池)
+		r.Buffer.Write(currByte)
+
+		if lastByte == '\r' && currByte[0] == '\n' {
+			break
+		}
+		lastByte = currByte[0]
+	}
+
+	// 返回这一行的视图 (包含 \r\n)
+	return r.Buffer.Slice(start, r.Buffer.Len()), nil
+}
+
+// attach 处理逻辑：判断是简单结构还是 Array 成员
+func (r *Respond) attach(item RESP) {
+	// 1. 如果栈为空，说明当前不是在组建 Array，或者是 Array 的根节点
+	if len(r.stack) == 0 {
+		r.resp = item
+		// 注意：如果是 Array 根节点，后续由 WriteArray 负责入栈
+		return
+	}
+
+	// 2. 如果栈不为空，说明正在填充某个 Array 的成员
+	parent := r.stack[len(r.stack)-1]
+	parent.Array = append(parent.Array, item)
+
+	// 3. 检查当前层级是否填满，填满则出栈
+	r.checkStack()
+}
+
+func (r *Respond) checkStack() {
+	for len(r.stack) > 0 {
+		curr := r.stack[len(r.stack)-1]
+		if len(curr.Array) < curr.Count {
+			break // 当前层还没填满，停止向上回溯
+		}
+		// 当前层填满了，弹出
+		r.stack = r.stack[:len(r.stack)-1]
+	}
+}
+
+// WriteNull writes a null to the client
+func (r *Respond) WriteNull() {
+	res := AppendNull(r.Buffer)
+	r.attach(res)
+}
+
+// WriteArray writes an array header. You must then write additional
+// sub-responses to the client to complete the response.
+// For example to write two strings:
+//
+//	c.WriteArray(2)
+//	c.WriteBulkString("item 1")
+//	c.WriteBulkString("item 2")
+func (r *Respond) WriteArray(count int) {
+	res := AppendArray(r.Buffer, count)
+
+	// 先按照普通规则挂载（如果是根则设为 root，如果是子 Array 则挂到父 Array 下）
+	r.attach(res)
+
+	// 只有当 count > 0 时才需要入栈等待后续成员
+	if count > 0 {
+		var target *RESP
+		if len(r.stack) > 0 {
+			// 如果已经在栈里，说明是嵌套 Array，取父 Array 的最后一个元素（即刚刚 attach 进去的那个）
+			parent := r.stack[len(r.stack)-1]
+			target = &parent.Array[len(parent.Array)-1]
+		} else {
+			// 否则它就是根节点
+			target = &r.resp
+		}
+		r.stack = append(r.stack, target)
+	}
+}
+
+// WriteBulk writes bulk bytes to the client.
+func (r *Respond) WriteBulk(bulk []byte) *BufferView {
+	res := AppendBulk(r.Buffer, bulk)
+	r.attach(res)
+	return res.Data
+}
+
+// WriteBulkString writes a bulk string to the client.
+func (r *Respond) WriteBulkString(bulk string) {
+	res := AppendBulkString(r.Buffer, bulk)
+	r.attach(res)
+}
+
 // WriteError writes an error to the client.
 func (r *Respond) WriteError(msg string) {
-	AppendError(r.Buffer, msg)
+	res := AppendError(r.Buffer, msg)
+	r.attach(res)
 }
 
 // WriteString writes a string to the client.
 func (r *Respond) WriteString(msg string) {
-	AppendString(r.Buffer, msg)
+	res := AppendString(r.Buffer, msg)
+	r.attach(res)
 }
 
 // WriteInt writes an integer to the client.
@@ -282,20 +464,46 @@ func (r *Respond) WriteInt(num int) {
 
 // WriteInt64 writes a 64-bit signed integer to the client.
 func (r *Respond) WriteInt64(num int64) {
-	AppendInt(r.Buffer, num)
+	res := AppendInt(r.Buffer, num)
+	r.attach(res)
 }
 
 // WriteUint64 writes a 64-bit unsigned integer to the client.
 func (r *Respond) WriteUint64(num uint64) {
-	AppendUint(r.Buffer, num)
+	res := AppendUint(r.Buffer, num)
+	r.attach(res)
 }
 
 // WriteRaw writes raw data to the client.
 func (r *Respond) WriteRaw(data []byte) {
-	_, _ = r.Buffer.Write(data)
-}
+	if len(data) == 0 {
+		return
+	}
 
-func (r *Respond) Swap(r_ *Respond) { r.Buffer.Swap(r_.Buffer) }
+	// 1. 物理追加：寫入內存池，記錄區間
+	start := r.Buffer.Len()
+	_, _ = r.Buffer.Write(data)
+	end := r.Buffer.Len()
+
+	// 2. 邏輯掃描：僅針對本次寫入的 data 區間生成視圖
+	dataView := r.Buffer.Slice(start, end)
+
+	currentPos := 0
+	for currentPos < dataView.Len() {
+		// 調用你的原型函數：從當前位置切分視圖進行解析
+		// 如果 Type 為 0，代表數據不足或非法
+		n, resp := ReadNextRESP(dataView.Slice(currentPos, dataView.Len()))
+
+		if resp.Type == 0 || n <= 0 {
+			break
+		}
+
+		// 3. 同步掛載到邏輯樹（處理 Array 嵌套）
+		r.attach(resp)
+
+		currentPos += n
+	}
+}
 
 // WriteAny writes any type to client.
 //
@@ -317,6 +525,8 @@ func (r *Respond) WriteAny(v interface{}) {
 func (r *Respond) Close() {
 	r.Buffer.Free()
 }
+
+func (r *Respond) Swap(r_ *Respond) { r.Buffer.Swap(r_.Buffer) }
 
 func (r *Respond) Reset() {
 	r.Buffer.Free()
