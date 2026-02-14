@@ -85,6 +85,11 @@ func (b *Buffer) Slice(n, m int) *BufferView {
 	}
 }
 
+// Tail 返回从 n 到末尾的视图，等价于 Go 切片 b[n:].
+func (b *Buffer) Tail(n int) *BufferView {
+	return b.Slice(n, b.Len())
+}
+
 // Split 在 n 位置切断数据。
 // 原有的 b 将保留 [0, n) 字节（完整指令，通过拷贝分割点实现物理隔离）。
 // 返回的新 Buffer 将承接 [n, length) 字节（剩余流，通过位移实现零平移）。
@@ -350,6 +355,11 @@ func (v *BufferView) Slice(n, m int) *BufferView {
 		length:          length,
 		firstPageOffset: newFirstOff,
 	}
+}
+
+// Tail 返回从 n 到末尾的视图，等价于 Go 切片 v[n:].
+func (v *BufferView) Tail(n int) *BufferView {
+	return v.Slice(n, v.Len())
 }
 
 // GetBuffer 从池中获取一个干净的 Buffer 实例

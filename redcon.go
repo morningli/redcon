@@ -549,9 +549,271 @@ func (r *Respond) Reset() {
 
 // Reader represent a reader for RESP or telnet commands.
 type Reader struct {
-	rd   *bufio.Reader
-	buf  *Buffer
-	cmds []*Request
+	rd  *bufio.Reader
+	buf *Buffer
+	// argsbuf 为 ReadNextCommand 复用的临时参数缓冲区。
+	argsbuf [][]byte
+	cmds    []*Request
+
+	// pendingErr holds a delayed error. If we encounter an error after already
+	// having parsed one or more commands, we return the commands first and
+	// surface the error on the next read when no commands are produced.
+	pendingErr error
+
+	// 以下字段用于在 buf 中增量解析（半包/粘包）时保存中间状态。
+	mode      byte // 0=unknown, '*'=RESP, 't'=telnet/plain
+	scan      int  // scan cursor for finding '\n'
+	respCount int
+	respArg   int
+	respPos   int // current parsing cursor within buf
+	respStage int // 0: reading count line, 1: reading bulk len line, 2: waiting bulk body
+	bulkSize  int
+	bulkStart int
+	marks     []int // bulk data marks (start,end pairs) within current command
+}
+
+func (rd *Reader) resetReadState() {
+	rd.mode = 0
+	rd.scan = 0
+	rd.respCount = 0
+	rd.respArg = 0
+	rd.respPos = 0
+	rd.respStage = 0
+	rd.bulkSize = 0
+	rd.bulkStart = 0
+	rd.marks = rd.marks[:0]
+}
+
+func (rd *Reader) findLF(start int) (idx int, ok bool) {
+	b := rd.buf
+	for i := start; i < b.Len(); i++ {
+		if b.At(i) == '\n' {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// readOneCommand attempts to parse exactly one command from rd.buf.
+//
+// It returns:
+// - cmd: a parsed command (non-nil) when successful
+// - needMore: true when more bytes are required to continue parsing (half-packet)
+// - err: protocol error when encountered
+func (rd *Reader) readOneCommand() (cmd *Request, needMore bool, err error) {
+	b := rd.buf
+	if b.Len() == 0 {
+		rd.resetReadState()
+		return nil, true, nil
+	}
+	if rd.mode == 0 {
+		if b.At(0) == '*' {
+			rd.mode = '*'
+			rd.scan = 1
+			rd.respPos = 0
+			rd.respCount = 0
+			rd.respArg = 0
+			rd.marks = rd.marks[:0]
+		} else {
+			rd.mode = 't'
+			rd.scan = 0
+		}
+	}
+
+	switch rd.mode {
+	case 't':
+		// plain text command: wait for one full line.
+		i, ok := rd.findLF(rd.scan)
+		if !ok {
+			rd.scan = b.Len()
+			return nil, true, nil
+		}
+		rd.scan = i + 1
+
+		var line []byte
+		if i > 0 && b.At(i-1) == '\r' {
+			line = b.Slice(0, i-1).Bytes()
+		} else {
+			line = b.Slice(0, i).Bytes()
+		}
+		var args [][]byte
+		var quote bool
+		var quotech byte
+		var escape bool
+	outer:
+		for {
+			nline := make([]byte, 0, len(line))
+			for j := 0; j < len(line); j++ {
+				c := line[j]
+				if !quote {
+					if c == ' ' {
+						if len(nline) > 0 {
+							args = append(args, nline)
+						}
+						line = line[j+1:]
+						continue outer
+					}
+					if c == '"' || c == '\'' {
+						if j != 0 {
+							return nil, false, errUnbalancedQuotes
+						}
+						quotech = c
+						quote = true
+						line = line[j+1:]
+						continue outer
+					}
+				} else {
+					if escape {
+						escape = false
+						switch c {
+						case 'n':
+							c = '\n'
+						case 'r':
+							c = '\r'
+						case 't':
+							c = '\t'
+						}
+					} else if c == quotech {
+						quote = false
+						quotech = 0
+						args = append(args, nline)
+						line = line[j+1:]
+						if len(line) > 0 && line[0] != ' ' {
+							return nil, false, errUnbalancedQuotes
+						}
+						continue outer
+					} else if c == '\\' {
+						escape = true
+						continue
+					}
+				}
+				nline = append(nline, c)
+			}
+			if quote {
+				return nil, false, errUnbalancedQuotes
+			}
+			if len(line) > 0 {
+				args = append(args, line)
+			}
+			break
+		}
+
+		if len(args) == 0 {
+			// discard empty line and continue
+			b_ := b.Split(i + 1)
+			b.Swap(b_)
+			b_.Free()
+			rd.resetReadState()
+			return nil, false, nil
+		}
+
+		cmd = &Request{Raw: NewBuffer()}
+		wr := NewRespond()
+		wr.WriteArray(len(args))
+		for k := range args {
+			v := wr.WriteBulk(args[k])
+			cmd.Args = append(cmd.Args, v)
+		}
+		cmd.Raw.Swap(wr.Buffer)
+		wr.Close()
+
+		// consume the line bytes from buffer
+		b_ := b.Split(i + 1)
+		b.Swap(b_)
+		b_.Free()
+		rd.resetReadState()
+		return cmd, false, nil
+
+	case '*':
+		// RESP formatted command: incremental state machine.
+		if rd.respStage == 0 {
+			// parse multibulk length line: *<count>\r\n
+			i, ok := rd.findLF(rd.scan)
+			if !ok {
+				rd.scan = b.Len()
+				return nil, true, nil
+			}
+			if i == 0 || b.At(i-1) != '\r' {
+				return nil, false, errInvalidMultiBulkLength
+			}
+			count, ok := parseInt(b.Slice(1, i-1).Bytes())
+			if !ok || count <= 0 {
+				return nil, false, errInvalidMultiBulkLength
+			}
+			rd.respCount = count
+			rd.respArg = 0
+			rd.marks = rd.marks[:0]
+			rd.respPos = i + 1
+			rd.scan = rd.respPos + 1
+			rd.respStage = 1
+		}
+
+		for rd.respArg < rd.respCount {
+			switch rd.respStage {
+			case 1:
+				// parse bulk len line: $<size>\r\n
+				if rd.respPos >= b.Len() {
+					rd.scan = b.Len()
+					return nil, true, nil
+				}
+				if b.At(rd.respPos) != '$' {
+					return nil, false, &errProtocol{"expected '$', got '" + string(b.At(rd.respPos)) + "'"}
+				}
+				lenStart := rd.respPos + 1
+				if rd.scan < lenStart {
+					rd.scan = lenStart
+				}
+				i, ok := rd.findLF(rd.scan)
+				if !ok {
+					rd.scan = b.Len()
+					return nil, true, nil
+				}
+				if i == 0 || b.At(i-1) != '\r' {
+					return nil, false, errInvalidBulkLength
+				}
+				size, ok := parseInt(b.Slice(lenStart, i-1).Bytes())
+				if !ok || size < 0 {
+					return nil, false, errInvalidBulkLength
+				}
+				rd.bulkSize = size
+				rd.bulkStart = i + 1
+				rd.respStage = 2
+			case 2:
+				// waiting bulk body: <data>\r\n
+				if b.Len() < rd.bulkStart+rd.bulkSize+2 {
+					return nil, true, nil
+				}
+				if b.At(rd.bulkStart+rd.bulkSize) != '\r' || b.At(rd.bulkStart+rd.bulkSize+1) != '\n' {
+					return nil, false, errInvalidBulkLength
+				}
+				rd.marks = append(rd.marks, rd.bulkStart, rd.bulkStart+rd.bulkSize)
+				rd.respPos = rd.bulkStart + rd.bulkSize + 2
+				rd.respArg++
+				rd.scan = rd.respPos + 1
+				rd.bulkSize = 0
+				rd.bulkStart = 0
+				rd.respStage = 1
+			default:
+				rd.respStage = 1
+			}
+		}
+
+		// complete command ends at respPos
+		end := rd.respPos
+		cmd = &Request{}
+		b_ := b.Split(end)
+		b.Swap(b_)
+		cmd.Raw = b_
+		cmd.Args = make([]*BufferView, len(rd.marks)/2)
+		for h := 0; h < len(rd.marks); h += 2 {
+			cmd.Args[h/2] = cmd.Raw.Slice(rd.marks[h], rd.marks[h+1])
+		}
+		rd.resetReadState()
+		return cmd, false, nil
+	default:
+		rd.resetReadState()
+		return nil, false, nil
+	}
 }
 
 // NewReader returns a command reader which will read RESP or telnet commands.
@@ -585,196 +847,66 @@ func parseInt(b []byte) (int, bool) {
 	return n, true
 }
 
-func (rd *Reader) readCommands() ([]*Request, error) {
-	var cmds []*Request
+func (rd *Reader) readCommands() (cmds []*Request, err error) {
+	// If we end up with both commands and an error, return the commands first
+	// and delay the error to the next call.
+	defer func() {
+		if len(cmds) > 0 && err != nil {
+			rd.pendingErr = err
+			err = nil
+		}
+	}()
 
 	b := rd.buf
-	if b.Len() > 0 {
-		// we have data, yay!
-		// but is this enough data for a complete command? or multiple?
-	next:
 
-		switch b.At(0) {
-		default:
-			// just a plain text command
-			for i := 0; i < b.Len(); i++ {
-				if b.At(i) == '\n' {
-					var line []byte
-					if i > 0 && b.At(i-1) == '\r' {
-						line = b.Slice(0, i-1).Bytes()
-					} else {
-						line = b.Slice(0, i).Bytes()
-					}
-					var args [][]byte
-					var quote bool
-					var quotech byte
-					var escape bool
-				outer:
-					for {
-						nline := make([]byte, 0, len(line))
-						for i := 0; i < len(line); i++ {
-							c := line[i]
-							if !quote {
-								if c == ' ' {
-									if len(nline) > 0 {
-										args = append(args, nline)
-									}
-									line = line[i+1:]
-									continue outer
-								}
-								if c == '"' || c == '\'' {
-									if i != 0 {
-										return nil, errUnbalancedQuotes
-									}
-									quotech = c
-									quote = true
-									line = line[i+1:]
-									continue outer
-								}
-							} else {
-								if escape {
-									escape = false
-									switch c {
-									case 'n':
-										c = '\n'
-									case 'r':
-										c = '\r'
-									case 't':
-										c = '\t'
-									}
-								} else if c == quotech {
-									quote = false
-									quotech = 0
-									args = append(args, nline)
-									line = line[i+1:]
-									if len(line) > 0 && line[0] != ' ' {
-										return nil, errUnbalancedQuotes
-									}
-									continue outer
-								} else if c == '\\' {
-									escape = true
-									continue
-								}
-							}
-							nline = append(nline, c)
-						}
-						if quote {
-							return nil, errUnbalancedQuotes
-						}
-						if len(line) > 0 {
-							args = append(args, line)
-						}
-						break
-					}
-					if len(args) > 0 {
-						var cmd = &Request{Raw: NewBuffer()}
-						// convert this to resp command syntax
-						var wr = NewRespond()
-						wr.WriteArray(len(args))
-						for i := range args {
-							v := wr.WriteBulk(args[i])
-							cmd.Args = append(cmd.Args, v)
-						}
-						cmd.Raw.Swap(wr.Buffer)
-						cmds = append(cmds, cmd)
-						wr.Close()
-					}
-					b_ := b.Split(i + 1)
-					b.Swap(b_)
-					b_.Free()
-
-					if b.Len() > 0 {
-						goto next
-					} else {
-						goto done
-					}
-				}
-			}
-		case '*':
-			// resp formatted command
-			marks := make([]int, 0, 16)
-		outer2:
-			for i := 1; i < b.Len(); i++ {
-				if b.At(i) == '\n' {
-					if b.At(i-1) != '\r' {
-						return nil, errInvalidMultiBulkLength
-					}
-					count, ok := parseInt(b.Slice(1, i-1).Bytes())
-					if !ok || count <= 0 {
-						return nil, errInvalidMultiBulkLength
-					}
-					marks = marks[:0]
-					for j := 0; j < count; j++ {
-						// read bulk length
-						i++
-						if i < b.Len() {
-							if b.At(i) != '$' {
-								return nil, &errProtocol{"expected '$', got '" + string(b.At(i)) + "'"}
-							}
-							si := i
-							for ; i < b.Len(); i++ {
-								if b.At(i) == '\n' {
-									if b.At(i-1) != '\r' {
-										return nil, errInvalidBulkLength
-									}
-									size, ok := parseInt(b.Slice(si+1, i-1).Bytes())
-									if !ok || size < 0 {
-										return nil, errInvalidBulkLength
-									}
-									if i+size+2 >= b.Len() {
-										// not ready
-										break outer2
-									}
-									if b.At(i+size+2) != '\n' ||
-										b.At(i+size+1) != '\r' {
-										return nil, errInvalidBulkLength
-									}
-									i++
-									marks = append(marks, i, i+size)
-									i += size + 1
-									break
-								}
-							}
-						}
-					}
-					if len(marks) == count*2 {
-						var cmd Request
-						// just assign the slice
-						b_ := b.Split(i + 1)
-						b.Swap(b_)
-						cmd.Raw = b_
-						cmd.Args = make([]*BufferView, len(marks)/2)
-						// slice up the raw command into the args based on
-						// the recorded marks.
-						for h := 0; h < len(marks); h += 2 {
-							cmd.Args[h/2] = cmd.Raw.Slice(marks[h], marks[h+1])
-						}
-						cmds = append(cmds, &cmd)
-						if b.Len() > 0 {
-							goto next
-						} else {
-							goto done
-						}
-					}
-				}
-			}
-		}
-	done:
-	}
-	if len(cmds) > 0 {
-		return cmds, nil
-	}
-	if rd.rd == nil {
-		return nil, errIncompleteCommand
-	}
-	var newData = GetBuffer()
-	n, err := rd.rd.Read(newData[:])
-	if err != nil {
+	// If we have a pending error from the last call, only surface it when we
+	// can't produce any commands this time.
+	if rd.pendingErr != nil && b.Len() == 0 {
+		err = rd.pendingErr
+		rd.pendingErr = nil
 		return nil, err
 	}
-	_, _ = rd.buf.Write(newData[:n])
-	PutBuffer(newData)
-	return rd.readCommands()
+
+	for {
+		cmd, needMore, err := rd.readOneCommand()
+		if err != nil {
+			return cmds, err
+		}
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+			// continue to parse more from current buffer
+			continue
+		}
+		if len(cmds) > 0 {
+			return cmds, nil
+		}
+		if !needMore {
+			// nothing parsed, but not needMore: loop again
+			continue
+		}
+
+		// need more data from reader
+		if rd.rd == nil {
+			return nil, errIncompleteCommand
+		}
+		newData := GetBuffer()
+		n, rerr := rd.rd.Read(newData[:])
+		if n > 0 {
+			_, _ = b.Write(newData[:n])
+		}
+		PutBuffer(newData)
+
+		if rerr != nil {
+			if rerr == io.EOF && n > 0 {
+				// got bytes, try parse again
+				continue
+			}
+			return cmds, rerr
+		}
+		if n == 0 {
+			return cmds, errIncompleteCommand
+		}
+	}
 }
 
 // ReadCommands reads the next pipeline commands.
@@ -809,22 +941,37 @@ func (rd *Reader) ReadCommand() (*Request, error) {
 }
 
 func (rd *Reader) Close() {
-	rd.buf.Free()
+	if rd.buf != nil {
+		rd.buf.Free()
+		rd.buf = nil
+	}
+	rd.argsbuf = nil
+	rd.marks = nil
+	rd.cmds = nil
 }
 
 // Parse parses a raw RESP message and returns a command.
 func Parse(raw []byte) (*Request, error) {
-	buff := NewBuffer()
-	_, _ = buff.Write(raw)
-	rd := Reader{buf: buff}
-	cmds, err := rd.readCommands()
+	complete, args, _, leftover, err := ReadNextCommand(raw, nil)
 	if err != nil {
 		return nil, err
 	}
-	if rd.buf.Len() > 0 {
+	if !complete {
+		return nil, errIncompleteCommand
+	}
+	if len(leftover) > 0 {
 		return nil, errTooMuchData
 	}
-	return cmds[0], nil
+	cmd := &Request{Raw: NewBuffer()}
+	wr := NewRespond()
+	wr.WriteArray(len(args))
+	for i := range args {
+		v := wr.WriteBulk(args[i])
+		cmd.Args = append(cmd.Args, v)
+	}
+	cmd.Raw.Swap(wr.Buffer)
+	wr.Close()
+	return cmd, nil
 }
 
 // A Handler responds to an RESP request.
@@ -908,9 +1055,25 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 	rec := time.Now()
 	cmds, err := c_.rd.readCommands()
-	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-		// 这不是真正的错误，仅仅表示“当前缓冲区已空，请等待下次触发”
-		return
+
+	// 如果没有解析出任何请求：
+	// - io.ErrShortBuffer / EAGAIN / EWOULDBLOCK / incomplete 都表示“本次没有更多数据”，等下次触发即可。
+	if len(cmds) == 0 {
+		if err == nil ||
+			errors.Is(err, io.ErrShortBuffer) ||
+			errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) ||
+			errors.Is(err, errIncompleteCommand) {
+			return
+		}
+		// 其他错误（协议错误/IO 错误）继续走后续错误处理逻辑
+	}
+
+	// 如果已经解析出部分请求，但最后一个请求不完整，本次仍然先处理已解析的请求；
+	// 不完整部分的中间状态已经保存在 Reader 中，等待下次 OnTraffic 补齐即可。
+	if errors.Is(err, errIncompleteCommand) ||
+		errors.Is(err, io.ErrShortBuffer) ||
+		errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+		err = nil
 	}
 
 	_ = s.workers.Submit(c.RemoteAddr().String(), func(drop int) {

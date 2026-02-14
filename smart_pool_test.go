@@ -2,12 +2,13 @@ package redcon
 
 import (
 	"context"
-	"golang.org/x/time/rate"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 func TestSmartPool_NoLoss(t *testing.T) {

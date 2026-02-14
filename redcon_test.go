@@ -1,6 +1,7 @@
 package redcon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -205,6 +206,156 @@ func TestRandomCommands(t *testing.T) {
 
 func TestServerTCP(t *testing.T) {
 	testServerNetwork(t, "tcp", ":12345")
+}
+
+func TestServerTCP_PartialPacket(t *testing.T) {
+	// Use a free local port (best-effort) to avoid collisions.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("split host port: %v", err)
+	}
+	_ = ln.Close()
+	laddr := "127.0.0.1:" + port
+
+	closedCh := make(chan error, 1)
+	s := NewServerNetwork("tcp", laddr,
+		func(conn Conn, cmd *Request, res *Respond) {
+			switch strings.ToLower(string(cmd.Args[0].Bytes())) {
+			default:
+				res.WriteError("ERR unknown command '" + string(cmd.Args[0].Bytes()) + "'")
+			case "ping":
+				res.WriteString("PONG")
+			case "echo":
+				if len(cmd.Args) != 2 {
+					res.WriteError("ERR wrong number of arguments for 'echo' command")
+					return
+				}
+				res.WriteBulk(cmd.Args[1].Bytes())
+			}
+		},
+		nil,
+		nil,
+		func(conn Conn, err error) {
+			select {
+			case closedCh <- err:
+			default:
+			}
+		},
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ListenAndServe()
+	}()
+	defer func() {
+		_ = s.Close(context.Background())
+		<-done
+	}()
+
+	// Dial with retry to avoid flaky startup timing.
+	var c net.Conn
+	for i := 0; i < 50; i++ {
+		c, err = net.Dial("tcp", laddr)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	rd := bufio.NewReader(c)
+
+	readOneRESP := func() (string, error) {
+		prefix, err := rd.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		switch prefix {
+		case '+', '-', ':':
+			line, err := rd.ReadBytes('\n')
+			if err != nil {
+				return "", err
+			}
+			return string(append([]byte{prefix}, line...)), nil
+		case '$':
+			line, err := rd.ReadBytes('\n')
+			if err != nil {
+				return "", err
+			}
+			n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r"))
+			if err != nil {
+				return "", err
+			}
+			if n < 0 {
+				return string(append([]byte{'$'}, line...)), nil
+			}
+			body := make([]byte, n+2)
+			if _, err := io.ReadFull(rd, body); err != nil {
+				return "", err
+			}
+			out := append([]byte{'$'}, line...)
+			out = append(out, body...)
+			return string(out), nil
+		default:
+			return "", fmt.Errorf("unexpected resp prefix: %q", prefix)
+		}
+	}
+
+	assertConnStillOpen := func() {
+		// Give gnet a chance to process the first half-packet; it should NOT close the connection.
+		time.Sleep(80 * time.Millisecond)
+		select {
+		case cerr := <-closedCh:
+			t.Fatalf("connection closed unexpectedly while waiting for remaining bytes, err=%v", cerr)
+		default:
+		}
+	}
+
+	// 1) Send a RESP command in two halves, ensure server doesn't error/close on partial data.
+	// PING => +PONG\r\n
+	part1 := []byte("*1\r\n$4\r\nPI")
+	part2 := []byte("NG\r\n")
+	if _, err := c.Write(part1); err != nil {
+		t.Fatalf("write part1: %v", err)
+	}
+	assertConnStillOpen()
+	if _, err := c.Write(part2); err != nil {
+		t.Fatalf("write part2: %v", err)
+	}
+	got, err := readOneRESP()
+	if err != nil {
+		t.Fatalf("read resp: %v", err)
+	}
+	if got != "+PONG\r\n" {
+		t.Fatalf("expected %q, got %q", "+PONG\r\n", got)
+	}
+
+	// 2) Split in the middle of a bulk body to simulate "only received half".
+	// ECHO HELLO => $5\r\nHELLO\r\n
+	part3 := []byte("*2\r\n$4\r\nECHO\r\n$5\r\nHE")
+	part4 := []byte("LLO\r\n")
+	if _, err := c.Write(part3); err != nil {
+		t.Fatalf("write part3: %v", err)
+	}
+	assertConnStillOpen()
+	if _, err := c.Write(part4); err != nil {
+		t.Fatalf("write part4: %v", err)
+	}
+	got, err = readOneRESP()
+	if err != nil {
+		t.Fatalf("read resp2: %v", err)
+	}
+	if got != "$5\r\nHELLO\r\n" {
+		t.Fatalf("expected %q, got %q", "$5\r\nHELLO\r\n", got)
+	}
 }
 
 func testServerNetwork(t *testing.T, network, laddr string) {

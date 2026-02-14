@@ -269,13 +269,11 @@ func ReadNextCommand(packet []byte, argsbuf [][]byte) (
 					return false, args[:0], Redis, packet, errInvalidMultiBulkLength
 				}
 				count, ok := parseInt(packet[s : i-1])
-				if !ok || count < 0 {
+				// Redis commands must be an Array with a positive number of elements.
+				if !ok || count <= 0 {
 					return false, args[:0], Redis, packet, errInvalidMultiBulkLength
 				}
 				i++
-				if count == 0 {
-					return true, args[:0], Redis, packet[i:], nil
-				}
 			nextArg:
 				for j := 0; j < count; j++ {
 					if i == len(packet) {
@@ -292,7 +290,7 @@ func ReadNextCommand(packet []byte, argsbuf [][]byte) (
 								return false, args[:0], Redis, packet, errInvalidBulkLength
 							}
 							n, ok := parseInt(packet[s : i-1])
-							if !ok || count <= 0 {
+							if !ok || n < 0 {
 								return false, args[:0], Redis, packet, errInvalidBulkLength
 							}
 							i++
