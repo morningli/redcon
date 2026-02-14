@@ -14,7 +14,10 @@ import (
 func TestSmartPool_NoLoss(t *testing.T) {
 	// 1. 初始化池
 	// 模拟 128 个分片，最大 1000 个 ants worker
-	pool, _ := NewSmartPool(128, 1000)
+	pool, err := NewSmartPool(128, 1000)
+	if err != nil {
+		t.Fatalf("NewSmartPool error: %v", err)
+	}
 
 	var (
 		totalTasks    int32 = 1000000 // 100 万个总任务
@@ -24,6 +27,9 @@ func TestSmartPool_NoLoss(t *testing.T) {
 		connNum       = 100
 		limiter       = rate.NewLimiter(200000, 1000)
 	)
+	ctxAll, cancelAll := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelAll()
+	errCh := make(chan error, connNum)
 
 	// 2. 并发提交任务
 	start := time.Now()
@@ -34,19 +40,39 @@ func TestSmartPool_NoLoss(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < int(totalTasks)/connNum; j++ {
 				// 轮询使用连接 ID，模拟哈希碰撞和并发竞争
-				_ = limiter.Wait(context.Background())
-				err := pool.Submit(cid, func(drop int) {
-					// 模拟业务耗时（可选）
-					atomic.AddInt32(&dropTasks, int32(drop))
-					atomic.AddInt32(&executedTasks, 1)
-				})
-				if err != nil {
-					t.Log("Submit fail:" + err.Error())
+				if err := limiter.Wait(ctxAll); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancelAll()
+					return
+				}
+				for {
+					if ctxAll.Err() != nil {
+						return
+					}
+					err := pool.Submit(cid, func(drop int) {
+						// 模拟业务耗时（可选）
+						atomic.AddInt32(&dropTasks, int32(drop))
+						atomic.AddInt32(&executedTasks, 1)
+					})
+					if err == nil {
+						break
+					}
+					// 队列满时 Submit 可能返回错误；为保证“无丢失”，这里重试直到成功入队。
+					time.Sleep(200 * time.Microsecond)
 				}
 			}
 		}(i)
 	}
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("submit error: %v", err)
+		}
+	}
 
 	// 3. 给一点缓冲时间确保最后的任务执行完（因为 Submit 是异步的）
 	timeout := time.After(10 * time.Second)
