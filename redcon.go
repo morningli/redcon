@@ -1076,7 +1076,7 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		err = nil
 	}
 
-	_ = s.workers.Submit(c.RemoteAddr().String(), func(drop int) {
+	_ = s.workers.Submit(c.RemoteAddr().String(), func(ctx context.Context, drop int) {
 		for i := 0; i < drop; i++ {
 			err := c.AsyncWrite(ErrQueueOverflow, nil)
 			if err != nil {

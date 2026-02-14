@@ -1,23 +1,25 @@
 package redcon
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/panjf2000/ants/v2"
 )
 
 // Task 封装请求上下文
 type Task struct {
-	Handler func(drop int) // 具体的 Redis 处理逻辑
+	Ctx     context.Context // 带有超时的上下文
+	Handler func(ctx context.Context, dropped int)
 	Drop    int
 }
 
-// Bucket 每个连接的状态桶
 type Bucket struct {
-	id      string
 	tasks   chan *Task
-	running bool // 退化为普通 bool
+	id      string
+	running bool
 	drop    int
 }
 
@@ -71,7 +73,7 @@ func fnv34a(key string) uint32 {
 }
 
 // Submit 相同ID的任务会确保执行顺序，必须前一个任务处理完后再执行后一个
-func (p *SmartPool) Submit(id string, handler func(drop int)) error {
+func (p *SmartPool) Submit(id string, handler func(ctx context.Context, drop int)) error {
 	h := fnv34a(id)
 	s := p.shards[h&p.shardMask]
 
@@ -117,42 +119,60 @@ func (p *SmartPool) Submit(id string, handler func(drop int)) error {
 }
 
 func (p *SmartPool) processConn(id string, b *Bucket, s *shard) {
+	const (
+		maxQuota = 64
+		maxCost  = 500 * time.Millisecond
+	)
+
+	// 1. 记录开始时间
+	start := time.Now()
+	quota := maxQuota
+
 	for {
-		// 1. 批量处理：尽可能在不加锁的情况下清空当前任务队列，提高吞吐量
-		for {
+		for quota > 0 {
 			select {
 			case t := <-b.tasks:
+
+				// 2. 执行业务逻辑，传入 Context
 				if t.Handler != nil {
-					t.Handler(t.Drop)
-					t.Handler = nil // 显式释放引用，帮助 GC
+					t.Handler(t.Ctx, t.Drop)
+					t.Handler = nil
 				}
-				taskPool.Put(t) // 任务处理完立即归还到对象池
+
+				// 3. 计算耗时并识别慢连接
+				cost := time.Since(start)
+				if cost > maxCost {
+					// 识别为顽固慢连接，可以在此处记录日志或标记熔断
+					quota = 1
+				}
+
+				taskPool.Put(t)
+				quota--
 			default:
-				// 当前没有任务，准备进入收尾阶段
 				goto CHECK_EMPTY
 			}
 		}
 
-	CHECK_EMPTY:
-		// 2. 状态收敛：在分片锁的保护下执行清理，防止与 Submit 产生竞态
-		s.mu.Lock()
-
-		// 二次检查：如果在 select 判定为空到获取锁的间隙有新任务入队
+		// 4. 配额用尽，异步让出 (逻辑同前)
 		if len(b.tasks) > 0 {
-			s.mu.Unlock()
-			continue // 锁内发现新任务，解锁并跳回外层循环继续处理
+			go func() {
+				_ = p.workerPool.Submit(func() { p.processConn(id, b, s) })
+			}()
+			return
 		}
 
-		// 3. 彻底解绑：在锁内完成“从 Map 移除”和“重置运行状态”
-		// 这样可以确保 Submit 函数在锁内执行 exists 检查时，逻辑完全闭环
+	CHECK_EMPTY:
+		s.mu.Lock()
+		if len(b.tasks) > 0 {
+			s.mu.Unlock()
+			continue
+		}
 		delete(s.buckets, id)
 		b.running = false
-		b.id = "" // 清空身份标识，彻底消除指针悬挂导致的“发错人”风险
+		b.id = ""
 		s.mu.Unlock()
 
-		// 4. 安全归还：此时该 Bucket 已从分片映射中剔除，且没有 Worker 在运行
-		// 即使 Submit 在此瞬间进入，它也会因为 exists=false 而从池中获取新的 Bucket
 		bucketPool.Put(b)
-		return // 当前 Worker 协程功成身退
+		return
 	}
 }
