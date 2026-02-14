@@ -391,6 +391,86 @@ func TestWriter(t *testing.T) {
 	wr.Reset()
 }
 
+func TestRespond_WriteArray_GetRESP_Structure(t *testing.T) {
+	wr := NewRespond()
+
+	// Outer: [ Inner: [ :1, :2 ], Bulk("bar") ]
+	wr.WriteArray(2)
+	wr.WriteArray(2)
+	wr.WriteInt(1)
+	wr.WriteInt(2)
+	wr.WriteBulkString("bar")
+
+	resp := wr.GetRESP()
+	if resp.Type != Array || resp.Count != 2 || len(resp.Array) != 2 {
+		t.Fatalf("expected root Array count=2, got Type=%v Count=%d len=%d", resp.Type, resp.Count, len(resp.Array))
+	}
+	if resp.Array[0].Type != Array || resp.Array[0].Count != 2 || len(resp.Array[0].Array) != 2 {
+		t.Fatalf("expected root[0] Array count=2, got Type=%v Count=%d len=%d", resp.Array[0].Type, resp.Array[0].Count, len(resp.Array[0].Array))
+	}
+	if resp.Array[0].Array[0].Type != Integer || resp.Array[0].Array[0].Int() != 1 {
+		t.Fatalf("expected root[0][0]=:1, got Type=%v Int=%d", resp.Array[0].Array[0].Type, resp.Array[0].Array[0].Int())
+	}
+	if resp.Array[0].Array[1].Type != Integer || resp.Array[0].Array[1].Int() != 2 {
+		t.Fatalf("expected root[0][1]=:2, got Type=%v Int=%d", resp.Array[0].Array[1].Type, resp.Array[0].Array[1].Int())
+	}
+	if resp.Array[1].Type != Bulk || resp.Array[1].String() != "bar" {
+		t.Fatalf("expected root[1]=$bar, got Type=%v String=%q", resp.Array[1].Type, resp.Array[1].String())
+	}
+
+	expBytes := "*2\r\n*2\r\n:1\r\n:2\r\n$3\r\nbar\r\n"
+	if string(wr.Bytes()) != expBytes {
+		t.Fatalf("expected bytes=%q, got %q", expBytes, string(wr.Bytes()))
+	}
+}
+
+func TestRespond_ReadRESP_Structure(t *testing.T) {
+	raw := "*3\r\n+OK\r\n:1\r\n$3\r\nbar\r\n"
+	wr := NewRespond()
+	if err := wr.ReadRESP(bytes.NewReader([]byte(raw))); err != nil {
+		t.Fatalf("ReadRESP error: %v", err)
+	}
+
+	resp := wr.GetRESP()
+	if resp.Type != Array || resp.Count != 3 || len(resp.Array) != 3 {
+		t.Fatalf("expected Array count=3, got Type=%v Count=%d len=%d", resp.Type, resp.Count, len(resp.Array))
+	}
+	if resp.Array[0].Type != String || resp.Array[0].String() != "OK" {
+		t.Fatalf("expected [0]=+OK, got Type=%v String=%q", resp.Array[0].Type, resp.Array[0].String())
+	}
+	if resp.Array[1].Type != Integer || resp.Array[1].Int() != 1 {
+		t.Fatalf("expected [1]=:1, got Type=%v Int=%d", resp.Array[1].Type, resp.Array[1].Int())
+	}
+	if resp.Array[2].Type != Bulk || resp.Array[2].String() != "bar" {
+		t.Fatalf("expected [2]=$bar, got Type=%v String=%q", resp.Array[2].Type, resp.Array[2].String())
+	}
+	if string(wr.Bytes()) != raw {
+		t.Fatalf("expected buffer bytes=%q, got %q", raw, string(wr.Bytes()))
+	}
+}
+
+func TestRequest_WriteArray_WriteBulk_ArgsAndRaw(t *testing.T) {
+	req := NewRequest()
+	req.WriteArray(2)
+	req.WriteBulk([]byte("SET"))
+	req.WriteBulk([]byte("a"))
+
+	if len(req.Args) != 2 {
+		t.Fatalf("expected Args len=2, got %d", len(req.Args))
+	}
+	if string(req.Args[0].Bytes()) != "SET" {
+		t.Fatalf("expected Args[0]=%q, got %q", "SET", string(req.Args[0].Bytes()))
+	}
+	if string(req.Args[1].Bytes()) != "a" {
+		t.Fatalf("expected Args[1]=%q, got %q", "a", string(req.Args[1].Bytes()))
+	}
+
+	expRaw := "*2\r\n$3\r\nSET\r\n$1\r\na\r\n"
+	if string(req.Raw.Bytes()) != expRaw {
+		t.Fatalf("expected Raw=%q, got %q", expRaw, string(req.Raw.Bytes()))
+	}
+}
+
 func testMakeRawCommands(rawargs [][]string) []string {
 	var rawcmds []string
 	for i := 0; i < len(rawargs); i++ {
@@ -405,39 +485,44 @@ func testMakeRawCommands(rawargs [][]string) []string {
 }
 
 func TestReaderRespRandom(t *testing.T) {
+	// This test previously had placeholder code that produced nil-slice index
+	// linter warnings. Keep it small but real to validate RESP reader stability.
 	rand.Seed(time.Now().UnixNano())
-	for h := 0; h < 10000; h++ {
-		var rawargs [][]string
-		for i := 0; i < 100; i++ {
-			// var args []string
-			n := int(rand.Int() % 16)
-			for j := 0; j < n; j++ {
-				arg := make([]byte, rand.Int()%512)
-				rand.Read(arg)
-				// args = append(args, string(arg))
-			}
+
+	commands := 200
+	maxArgs := 8
+	maxArgBytes := 64
+
+	rawargs := make([][]string, 0, commands)
+	for i := 0; i < commands; i++ {
+		n := int(rand.Int()%maxArgs) + 1 // at least 1 arg
+		args := make([]string, 0, n)
+		for j := 0; j < n; j++ {
+			ln := int(rand.Int() % maxArgBytes)
+			b := make([]byte, ln)
+			_, _ = rand.Read(b)
+			args = append(args, string(b))
 		}
-		rawcmds := testMakeRawCommands(rawargs)
-		data := strings.Join(rawcmds, "")
-		rd := NewReader(bytes.NewBufferString(data))
-		for i := 0; i < len(rawcmds); i++ {
-			if len(rawargs[i]) == 0 {
-				continue
-			}
-			cmd, err := rd.ReadCommand()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(cmd.Raw.Bytes()) != rawcmds[i] {
-				t.Fatalf("expected '%v', got '%v'", rawcmds[i], string(cmd.Raw.Bytes()))
-			}
-			if len(cmd.Args) != len(rawargs[i]) {
-				t.Fatalf("expected '%v', got '%v'", len(rawargs[i]), len(cmd.Args))
-			}
-			for j := 0; j < len(rawargs[i]); j++ {
-				if string(cmd.Args[j].Bytes()) != rawargs[i][j] {
-					t.Fatalf("expected '%v', got '%v'", rawargs[i][j], string(cmd.Args[j].Bytes()))
-				}
+		rawargs = append(rawargs, args)
+	}
+
+	rawcmds := testMakeRawCommands(rawargs)
+	data := strings.Join(rawcmds, "")
+	rd := NewReader(bytes.NewBufferString(data))
+	for i := 0; i < len(rawcmds); i++ {
+		cmd, err := rd.ReadCommand()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(cmd.Raw.Bytes()) != rawcmds[i] {
+			t.Fatalf("expected '%v', got '%v'", rawcmds[i], string(cmd.Raw.Bytes()))
+		}
+		if len(cmd.Args) != len(rawargs[i]) {
+			t.Fatalf("expected '%v', got '%v'", len(rawargs[i]), len(cmd.Args))
+		}
+		for j := 0; j < len(rawargs[i]); j++ {
+			if string(cmd.Args[j].Bytes()) != rawargs[i][j] {
+				t.Fatalf("expected '%v', got '%v'", rawargs[i][j], string(cmd.Args[j].Bytes()))
 			}
 		}
 	}
