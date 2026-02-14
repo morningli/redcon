@@ -182,15 +182,28 @@ type Request struct {
 	FlushTime       time.Time
 }
 
-func NewRequest() *Request                  { return &Request{Raw: NewBuffer()} }
-func (r *Request) Free()                    { r.Raw.Free() }
-func (r *Request) Context() interface{}     { return r.ctx }
+// NewRequest 创建一个空 Request，并初始化 Raw 缓冲区。
+func NewRequest() *Request { return &Request{Raw: NewBuffer()} }
+
+// Free 释放 Request 持有的 Raw 缓冲区。
+func (r *Request) Free() { r.Raw.Free() }
+
+// Context 返回与该请求关联的用户上下文。
+func (r *Request) Context() interface{} { return r.ctx }
+
+// SetContext 设置与该请求关联的用户上下文。
 func (r *Request) SetContext(v interface{}) { r.ctx = v }
-func (r *Request) WriteArray(count int)     { AppendArray(r.Raw, count) }
+
+// WriteArray 向 Raw 追加一个 Array 头（元素数量为 count）。
+func (r *Request) WriteArray(count int) { AppendArray(r.Raw, count) }
+
+// WriteBulk 向 Raw 追加一个 Bulk，并把其 Data 视图追加到 Args。
 func (r *Request) WriteBulk(bulk []byte) {
 	v := AppendBulk(r.Raw, bulk)
 	r.Args = append(r.Args, v.Data)
 }
+
+// WriteRaw 直接向 Raw 追加字节（不做解析）。
 func (r *Request) WriteRaw(data []byte) { _, _ = r.Raw.Write(data) }
 
 // Server defines a server for clients for managing client connections.
@@ -235,6 +248,7 @@ func (r *Respond) Data() [][]byte {
 	return r.Buffer.Data()
 }
 
+// Bytes 返回当前缓冲区内容拼接后的单个 []byte（会发生拷贝）。
 func (r *Respond) Bytes() []byte {
 	return r.Buffer.Bytes()
 }
@@ -480,25 +494,25 @@ func (r *Respond) WriteRaw(data []byte) {
 		return
 	}
 
-	// 1. 物理追加：寫入內存池，記錄區間
+	// 1. 物理追加：写入内存池，记录区间
 	start := r.Buffer.Len()
 	_, _ = r.Buffer.Write(data)
 	end := r.Buffer.Len()
 
-	// 2. 邏輯掃描：僅針對本次寫入的 data 區間生成視圖
+	// 2. 逻辑扫描：仅针对本次写入的 data 区间生成视图
 	dataView := r.Buffer.Slice(start, end)
 
 	currentPos := 0
 	for currentPos < dataView.Len() {
-		// 調用你的原型函數：從當前位置切分視圖進行解析
-		// 如果 Type 為 0，代表數據不足或非法
+		// 调用你的原型函数：从当前位置切分视图进行解析
+		// 如果 Type 为 0，代表数据不足或非法
 		n, resp := ReadNextRESP(dataView.Slice(currentPos, dataView.Len()))
 
 		if resp.Type == 0 || n <= 0 {
 			break
 		}
 
-		// 3. 同步掛載到邏輯樹（處理 Array 嵌套）
+		// 3. 同步挂载到逻辑树（处理 Array 嵌套）
 		r.attach(resp)
 
 		currentPos += n
@@ -850,7 +864,6 @@ func (s *Server) OnBoot(eng gnet.Engine) (action gnet.Action) {
 }
 
 func (s *Server) OnShutdown(eng gnet.Engine) {
-	return
 }
 
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {

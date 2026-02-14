@@ -6,20 +6,24 @@ import (
 	"sync"
 )
 
+// ChunkSize 表示每个物理页（Chunk）的字节大小。
 const ChunkSize = 4096
 
+// Chunk 是 Buffer 使用的固定大小内存页（从对象池复用）。
 type Chunk [ChunkSize]byte
 
 var chunkPool = sync.Pool{
 	New: func() interface{} { return new(Chunk) },
 }
 
+// Buffer 是基于固定大小页的可增长字节缓冲区，支持零拷贝 Slice。
 type Buffer struct {
 	pages           []*Chunk
 	length          int // 逻辑上的总有效数据长度
 	firstPageOffset int // 第一页的起始有效数据偏移（0 ~ ChunkSize-1）
 }
 
+// NewBuffer 创建一个空 Buffer。
 func NewBuffer() *Buffer {
 	return &Buffer{
 		pages: make([]*Chunk, 0, 8),

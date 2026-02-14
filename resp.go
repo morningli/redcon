@@ -21,6 +21,7 @@ const (
 	Error   Type = '-'
 )
 
+// GetType 返回 b 首字节对应的 RESP 类型标记；b 为空时返回 0。
 func GetType(b *Buffer) Type {
 	if b.Len() == 0 {
 		return 0
@@ -28,6 +29,7 @@ func GetType(b *Buffer) Type {
 	return Type(b.At(0))
 }
 
+// GetArrayLength 返回 Array RESP 的元素数量；对非 Array 类型返回 1。
 func GetArrayLength(b *Buffer) (int, error) {
 	if GetType(b) != Array {
 		return 1, nil
@@ -40,6 +42,7 @@ func GetArrayLength(b *Buffer) (int, error) {
 	return 0, errors.New("unexpected EOF")
 }
 
+// RESP 表示一次解析后的 RESP 消息结构。
 type RESP struct {
 	Type  Type
 	Raw   *BufferView
@@ -60,19 +63,23 @@ func (r RESP) ForEach(iter func(resp RESP) bool) {
 	}
 }
 
+// Bytes 返回 RESP 数据部分（Data）的字节内容（会发生拷贝）。
 func (r RESP) Bytes() []byte {
 	return r.Data.Bytes()
 }
 
+// String 将 RESP 数据部分（Data）转换为 string。
 func (r RESP) String() string {
 	return string(r.Data.Bytes())
 }
 
+// Int 将 RESP 数据部分按十进制解析为 int64（解析失败返回 0）。
 func (r RESP) Int() int64 {
 	x, _ := strconv.ParseInt(r.String(), 10, 64)
 	return x
 }
 
+// Float 将 RESP 数据部分解析为 float64（解析失败返回 0）。
 func (r RESP) Float() float64 {
 	x, _ := strconv.ParseFloat(r.String(), 10)
 	return x
@@ -101,6 +108,7 @@ func (r RESP) Map() map[string]RESP {
 	return m
 }
 
+// MapGet 从 key/value 形式的 Array 中按 key 获取对应的值。
 func (r RESP) MapGet(key string) RESP {
 	if r.Type != Array {
 		return RESP{}
@@ -121,6 +129,7 @@ func (r RESP) MapGet(key string) RESP {
 	return val
 }
 
+// Exists 判断 r 是否为有效 RESP（Type != 0）。
 func (r RESP) Exists() bool {
 	return r.Type != 0
 }
@@ -519,22 +528,22 @@ func AppendBulkString(b *Buffer, bulk string) RESP {
 
 // AppendString appends a Redis protocol string to the input bytes.
 func AppendString(b *Buffer, s string) RESP {
-	// 1. 記錄起始物理位移
+	// 1. 记录起始物理位移
 	start := b.Len()
 
-	// 2. 執行物理寫入 (利用內存池 Buffer)
+	// 2. 执行物理写入 (利用内存池 Buffer)
 	_, _ = b.Write([]byte{'+'})
 	_, _ = b.Write([]byte(stripNewlines(s)))
 	_, _ = b.Write([]byte{'\r', '\n'})
 
-	// 3. 獲取當前總長度
+	// 3. 获取当前总长度
 	end := b.Len()
 
-	// 4. 返回邏輯結構
+	// 4. 返回逻辑结构
 	return RESP{
 		Type: String, // 即 '+'
 		Raw:  b.Slice(start, end),
-		Data: b.Slice(start+1, end-2), // 排除前綴 '+' 和末尾 '\r\n'
+		Data: b.Slice(start+1, end-2), // 排除前缀 '+' 和末尾 '\r\n'
 	}
 }
 
@@ -709,13 +718,13 @@ func AppendAny(b *Buffer, v interface{}) RESP {
 		_, _ = b.Write(data)
 		end := b.Len()
 
-		// 獲取寫入數據的視圖
+		// 获取写入数据的视图
 		view := b.Slice(start, end)
-		// 調用原型：func ReadNextRESP(b *BufferView) (n int, resp RESP)
-		// 這樣可以準確識別 Marshaler 產生的 RESP 類型 (如 Array 或 Bulk)
+		// 调用原型：func ReadNextRESP(b *BufferView) (n int, resp RESP)
+		// 这样可以准确识别 Marshaler 产生的 RESP 类型 (如 Array 或 Bulk)
 		n, resp := ReadNextRESP(view)
 		if resp.Type == 0 || n == 0 {
-			// 解析失敗降級處理：視為原始 Bulk 或錯誤
+			// 解析失败降级处理：视为原始 Bulk 或错误
 			return RESP{Type: Type(data[0]), Raw: view, Data: view}
 		}
 		return resp
@@ -735,7 +744,7 @@ func AppendAny(b *Buffer, v interface{}) RESP {
 				Type:  Array,
 				Count: n,
 				Raw:   b.Slice(start, end),
-				Data:  b.Slice(headerResp.Raw.Len(), end), // Data 為 header 之後的部分
+				Data:  b.Slice(headerResp.Raw.Len(), end), // Data 为 header 之后的部分
 				Array: childResps,
 			}
 		case reflect.Map:

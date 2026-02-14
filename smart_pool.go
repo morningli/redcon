@@ -2,17 +2,18 @@ package redcon
 
 import (
 	"errors"
-	"github.com/panjf2000/ants/v2"
 	"sync"
+
+	"github.com/panjf2000/ants/v2"
 )
 
-// Task 封裝请求上下文
+// Task 封装请求上下文
 type Task struct {
 	Handler func(drop int) // 具体的 Redis 处理逻辑
 	Drop    int
 }
 
-// Bucket 每個连接的状态桶
+// Bucket 每个连接的状态桶
 type Bucket struct {
 	id      string
 	tasks   chan *Task
@@ -21,14 +22,15 @@ type Bucket struct {
 }
 
 var (
-	// 对象池：複用 Task 结构
+	// 对象池：复用 Task 结构
 	taskPool = sync.Pool{New: func() interface{} { return &Task{} }}
-	// 对象池：複用连接桶，避免 3w 连接频繁分配內存
+	// 对象池：复用连接桶，避免 3w 连接频繁分配内存
 	bucketPool = sync.Pool{New: func() interface{} {
 		return &Bucket{tasks: make(chan *Task, 128)}
 	}}
 )
 
+// SmartPool 基于 worker pool 提供“按连接串行、跨连接并行”的任务执行能力。
 type SmartPool struct {
 	shards     []*shard
 	workerPool *ants.Pool
@@ -40,7 +42,7 @@ type shard struct {
 	buckets map[string]*Bucket
 }
 
-// NewSmartPool 推荐 shardCount=1024, antsSize=实际核心數*2~10
+// NewSmartPool 推荐 shardCount=1024, antsSize=实际核心数*2~10
 func NewSmartPool(shardCount int, antsSize int) (*SmartPool, error) {
 	wp, err := ants.NewPool(antsSize, ants.WithNonblocking(false))
 	if err != nil {
@@ -106,7 +108,7 @@ func (p *SmartPool) Submit(id string, handler func(drop int)) error {
 		taskPool.Put(t)
 		bucket.drop++
 
-		// 可选：记录丢弃日志或上报监控指標
+		// 可选：记录丢弃日志或上报监控指标
 		// metrics.Incr("proxy.request.drop")
 		// fmt.Printf("connection %s queue full, request dropped\n", id)
 		return errors.New("task pool full")
