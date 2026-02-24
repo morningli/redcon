@@ -12,15 +12,16 @@ import (
 // Task 封装请求上下文
 type Task struct {
 	Ctx     context.Context // 带有超时的上下文
-	Handler func(ctx context.Context, dropped int)
+	Handler func(ctx context.Context)
 	Drop    int
 }
 
 type Bucket struct {
-	tasks   chan *Task
-	id      string
-	running bool
-	drop    int
+	tasks      chan *Task
+	id         string
+	running    bool
+	drop       int
+	flushDrops func(drop int)
 }
 
 var (
@@ -73,7 +74,7 @@ func fnv34a(key string) uint32 {
 }
 
 // Submit 相同ID的任务会确保执行顺序，必须前一个任务处理完后再执行后一个
-func (p *SmartPool) Submit(id string, handler func(ctx context.Context, drop int)) error {
+func (p *SmartPool) Submit(id string, flushDrops func(drop int), handler func(ctx context.Context)) error {
 	h := fnv34a(id)
 	s := p.shards[h&p.shardMask]
 
@@ -84,7 +85,13 @@ func (p *SmartPool) Submit(id string, handler func(ctx context.Context, drop int
 		bucket.id = id
 		bucket.running = false
 		bucket.drop = 0
+		// Initialize flushDrops on first creation (may be nil).
+		bucket.flushDrops = flushDrops
 		s.buckets[id] = bucket
+	}
+	// Update flushDrops callback when provided. Don't overwrite an existing callback with nil.
+	if flushDrops != nil {
+		bucket.flushDrops = flushDrops
 	}
 
 	// 1. 获取 Task 对象
@@ -135,9 +142,15 @@ func (p *SmartPool) processConn(id string, b *Bucket, s *shard) {
 			select {
 			case t := <-b.tasks:
 
+				// Flush pending drops for this task before running business logic.
+				// Drop flushing should NOT consume quota.
+				if t.Drop > 0 && b.flushDrops != nil {
+					b.flushDrops(t.Drop)
+				}
+
 				// 2. 执行业务逻辑，传入 Context
 				if t.Handler != nil {
-					t.Handler(t.Ctx, t.Drop)
+					t.Handler(t.Ctx)
 					t.Handler = nil
 				}
 
@@ -169,15 +182,21 @@ func (p *SmartPool) processConn(id string, b *Bucket, s *shard) {
 			s.mu.Unlock()
 			continue
 		}
-		// 如果存在 pending drop，不要回收 bucket，否则 drop 会丢失，导致 pipeline 语义错误。
-		if b.drop > 0 {
-			b.running = false
+		// If there are pending drops, allow business to flush them immediately.
+		// This is invoked only when the queue is empty, so it won't break pipeline ordering.
+		if b.drop > 0 && b.flushDrops != nil {
+			drop := b.drop
+			flush := b.flushDrops
+			b.drop = 0
 			s.mu.Unlock()
-			return
+			flush(drop)
+			continue
 		}
+
 		delete(s.buckets, id)
 		b.running = false
 		b.id = ""
+		b.flushDrops = nil
 		b.drop = 0
 		s.mu.Unlock()
 

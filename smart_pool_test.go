@@ -22,7 +22,6 @@ func TestSmartPool_NoLoss(t *testing.T) {
 	var (
 		totalTasks    int32 = 1000000 // 100 万个总任务
 		executedTasks int32 = 0       // 实际执行的任务数
-		dropTasks     int32 = 0
 		wg            sync.WaitGroup
 		connNum       = 100
 		limiter       = rate.NewLimiter(200000, 1000)
@@ -52,9 +51,8 @@ func TestSmartPool_NoLoss(t *testing.T) {
 					if ctxAll.Err() != nil {
 						return
 					}
-					err := pool.Submit(cid, func(_ context.Context, drop int) {
+					err := pool.Submit(cid, nil, func(_ context.Context) {
 						// 模拟业务耗时（可选）
-						atomic.AddInt32(&dropTasks, int32(drop))
 						atomic.AddInt32(&executedTasks, 1)
 					})
 					if err == nil {
@@ -78,7 +76,7 @@ func TestSmartPool_NoLoss(t *testing.T) {
 	timeout := time.After(10 * time.Second)
 	tk := time.NewTicker(time.Second * 5)
 	defer tk.Stop()
-	for atomic.LoadInt32(&executedTasks)+atomic.LoadInt32(&dropTasks) < totalTasks {
+	for atomic.LoadInt32(&executedTasks) < totalTasks {
 		select {
 		case <-tk.C:
 			t.Logf("processed %d tasks", executedTasks)
@@ -90,7 +88,7 @@ func TestSmartPool_NoLoss(t *testing.T) {
 		}
 	}
 
-	t.Logf("测试通过！成功执行 %d 任务，丢弃 %d 任务，耗时: %v", executedTasks, dropTasks, time.Since(start))
+	t.Logf("测试通过！成功执行 %d 任务，耗时: %v", executedTasks, time.Since(start))
 }
 
 func TestSmartPool_Fairness(t *testing.T) {
@@ -115,7 +113,7 @@ func TestSmartPool_Fairness(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < tasksA; i++ {
-			pool.Submit(connA, func(context.Context, int) {
+			pool.Submit(connA, nil, func(context.Context) {
 				// 模拟耗时，放大 CPU 占用
 				time.Sleep(time.Millisecond)
 				atomic.AddInt32(&executedA, 1)
@@ -130,7 +128,7 @@ func TestSmartPool_Fairness(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < tasksB; i++ {
-			_ = pool.Submit(connB, func(_ context.Context, int2 int) {
+			_ = pool.Submit(connB, nil, func(_ context.Context) {
 				time.Sleep(time.Millisecond)
 				atomic.AddInt32(&executedB, 1)
 			})

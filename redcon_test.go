@@ -1003,7 +1003,7 @@ func TestOnTraffic_Drop_ReleasesBufferToPool(t *testing.T) {
 	// Block the only worker so the per-conn queue can be filled to capacity.
 	started := make(chan struct{})
 	block := make(chan struct{})
-	if err := s.workers.Submit(id, func(ctx context.Context, drop int) {
+	if err := s.workers.Submit(id, nil, func(ctx context.Context) {
 		close(started)
 		<-block
 	}); err != nil {
@@ -1013,7 +1013,7 @@ func TestOnTraffic_Drop_ReleasesBufferToPool(t *testing.T) {
 
 	// Fill the per-conn queue (128).
 	for i := 0; i < 128; i++ {
-		if err := s.workers.Submit(id, func(context.Context, int) {}); err != nil {
+		if err := s.workers.Submit(id, nil, func(context.Context) {}); err != nil {
 			t.Fatalf("fill submit %d: %v", i, err)
 		}
 	}
@@ -1064,7 +1064,7 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 	// Block worker so we can fill the queue to capacity.
 	started := make(chan struct{})
 	block := make(chan struct{})
-	if err := s.workers.Submit(id, func(ctx context.Context, drop int) {
+	if err := s.workers.Submit(id, nil, func(ctx context.Context) {
 		close(started)
 		<-block
 	}); err != nil {
@@ -1076,7 +1076,7 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 	var fillWG sync.WaitGroup
 	fillWG.Add(128)
 	for i := 0; i < 128; i++ {
-		if err := s.workers.Submit(id, func(context.Context, int) { fillWG.Done() }); err != nil {
+		if err := s.workers.Submit(id, nil, func(context.Context) { fillWG.Done() }); err != nil {
 			t.Fatalf("fill submit %d: %v", i, err)
 		}
 	}
@@ -1087,7 +1087,7 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 		s.OnTraffic(c)
 	}
 
-	// Unblock and wait for the 128 fill tasks to drain.
+	// Unblock and wait for the 128 fill tasks to complete.
 	close(block)
 	drainDone := make(chan struct{})
 	go func() {
@@ -1100,7 +1100,29 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 		t.Fatalf("timeout waiting for queue drain")
 	}
 
-	// Next accepted request should return N overflow errors, then PONG.
+	// With SmartPool flushDrops callback, drops should be flushed as soon as the queue drains,
+	// without waiting for a follow-up request.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		frames := c.getFrames()
+		if len(frames) > 0 {
+			got := bytes.Join(frames, nil)
+			want := bytes.Repeat(ErrQueueOverflow, N)
+			if len(got) >= len(want) {
+				if !bytes.Equal(got, want) {
+					t.Fatalf("expected overflow bytes=%q, got %q", string(want), string(got))
+				}
+				break
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %d overflow frames, got %d", N, len(frames))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Next accepted request should get its normal response only.
 	c.resetFrames()
 	done := make(chan struct{})
 	s.after = func(conn Conn, cmd *Request, res *Respond) {
@@ -1117,17 +1139,11 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timeout waiting for response")
 	}
-
 	frames := c.getFrames()
-	if len(frames) != N+1 {
-		t.Fatalf("expected %d frames, got %d", N+1, len(frames))
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(frames))
 	}
-	for i := 0; i < N; i++ {
-		if string(frames[i]) != string(ErrQueueOverflow) {
-			t.Fatalf("frame[%d] expected %q, got %q", i, string(ErrQueueOverflow), string(frames[i]))
-		}
-	}
-	if string(frames[N]) != "+PONG\r\n" {
-		t.Fatalf("last frame expected %q, got %q", "+PONG\r\n", string(frames[N]))
+	if string(frames[0]) != "+PONG\r\n" {
+		t.Fatalf("expected %q, got %q", "+PONG\r\n", string(frames[0]))
 	}
 }

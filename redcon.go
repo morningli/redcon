@@ -1052,6 +1052,7 @@ var (
 
 func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	c_ := c.Context().(*conn)
+	id := c.RemoteAddr().String()
 
 	rec := time.Now()
 	cmds, err := c_.rd.readCommands()
@@ -1076,15 +1077,29 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		err = nil
 	}
 
-	if err != nil {
-		err = s.workers.Submit(c.RemoteAddr().String(), func(ctx context.Context, drop int) {
-			for i := 0; i < drop; i++ {
-				err := c.AsyncWrite(ErrQueueOverflow, nil)
-				if err != nil {
-					_ = c_.close()
-					return
-				}
+	flushDrops := func(drop int) {
+		b := NewBuffer()
+		for i := 0; i < drop; i++ {
+			b.Write(ErrQueueOverflow)
+		}
+		werr := c.AsyncWritev(b.Data(), func(c gnet.Conn, err error) error {
+			if err != nil {
+				b.Free()
+				_ = c_.close()
+				return err
 			}
+			b.Free()
+			return nil
+		})
+		if werr != nil {
+			b.Free()
+			_ = c_.close()
+			return
+		}
+	}
+
+	if err != nil {
+		err = s.workers.Submit(id, flushDrops, func(ctx context.Context) {
 			if err, ok := err.(*errProtocol); ok {
 				_ = c.AsyncWrite([]byte("-ERR "+err.Error()), nil)
 			}
@@ -1094,15 +1109,7 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 	for _, cmd := range cmds {
 		cmd := cmd
-		err = s.workers.Submit(c.RemoteAddr().String(), func(ctx context.Context, drop int) {
-			for i := 0; i < drop; i++ {
-				err := c.AsyncWrite(ErrQueueOverflow, nil)
-				if err != nil {
-					_ = c_.close()
-					return
-				}
-			}
-
+		err = s.workers.Submit(id, flushDrops, func(ctx context.Context) {
 			var res = NewRespond()
 			cmd.ReceiveTime = rec
 			cmd.ProcessTime = time.Now()
