@@ -57,7 +57,7 @@ func NewServer(addr string,
 	accept func(conn Conn) error,
 	closed func(conn Conn, err error),
 ) *Server {
-	return NewServerNetwork("tcp", addr, after, handler, accept, closed)
+	return NewServerNetwork("tcp", addr, handler, after, accept, closed)
 }
 
 // NewServerNetwork returns a new Redcon server. The network net must be
@@ -1076,33 +1076,33 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		err = nil
 	}
 
-	_ = s.workers.Submit(c.RemoteAddr().String(), func(ctx context.Context, drop int) {
-		for i := 0; i < drop; i++ {
-			err := c.AsyncWrite(ErrQueueOverflow, nil)
-			if err != nil {
-				_ = c_.close()
-				return
+	if err != nil {
+		err = s.workers.Submit(c.RemoteAddr().String(), func(ctx context.Context, drop int) {
+			for i := 0; i < drop; i++ {
+				err := c.AsyncWrite(ErrQueueOverflow, nil)
+				if err != nil {
+					_ = c_.close()
+					return
+				}
 			}
-		}
-
-		if err != nil {
 			if err, ok := err.(*errProtocol); ok {
-				// All protocol errors should attempt a response to
-				// the client. Ignore write errors.
 				_ = c.AsyncWrite([]byte("-ERR "+err.Error()), nil)
 			}
 			_ = c_.close()
-			return
-		}
+		})
+	}
 
-		var callback gnet.AsyncCallback = func(c gnet.Conn, err error) error {
-			if err != nil {
-				_ = c_.close()
+	for _, cmd := range cmds {
+		cmd := cmd
+		err = s.workers.Submit(c.RemoteAddr().String(), func(ctx context.Context, drop int) {
+			for i := 0; i < drop; i++ {
+				err := c.AsyncWrite(ErrQueueOverflow, nil)
+				if err != nil {
+					_ = c_.close()
+					return
+				}
 			}
-			return nil
-		}
 
-		for _, cmd := range cmds {
 			var res = NewRespond()
 			cmd.ReceiveTime = rec
 			cmd.ProcessTime = time.Now()
@@ -1110,26 +1110,41 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 				s.handler(c_, cmd, res)
 			}
 			cmd.ProcessDoneTime = time.Now()
+
+			var callback gnet.AsyncCallback = func(c gnet.Conn, err error) error {
+				if err != nil {
+					cmd.Free()
+					res.Close()
+					_ = c_.close()
+					return err
+				}
+				cmd.FlushTime = time.Now()
+				if s.after != nil {
+					s.after(c_, cmd, res)
+				}
+				cmd.Free()
+				res.Close()
+				return nil
+			}
 			if s.handler != nil {
 				err = c.AsyncWritev(res.Data(), callback)
 			} else {
 				err = c.AsyncWrite(ErrNoHandler, callback)
 			}
-			cmd.FlushTime = time.Now()
-			if s.after != nil {
-				s.after(c_, cmd, res)
-			}
-			cmd.Free()
-			res.Close()
 			if err != nil {
+				cmd.Free()
+				res.Close()
 				_ = c_.close()
 				return
 			}
+			if c_.needClose {
+				_ = c_.close()
+			}
+		})
+		if err != nil {
+			cmd.Free()
 		}
-		if c_.needClose {
-			_ = c_.close()
-		}
-	})
+	}
 	return
 }
 

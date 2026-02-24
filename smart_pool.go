@@ -83,6 +83,7 @@ func (p *SmartPool) Submit(id string, handler func(ctx context.Context, drop int
 		bucket = bucketPool.Get().(*Bucket)
 		bucket.id = id
 		bucket.running = false
+		bucket.drop = 0
 		s.buckets[id] = bucket
 	}
 
@@ -103,12 +104,13 @@ func (p *SmartPool) Submit(id string, handler func(ctx context.Context, drop int
 		s.mu.Unlock()
 	default:
 		// 3. 队列满了：立即释放锁并丢弃任务
+		// 记录丢弃数量（在锁内更新，避免竞态/丢失）
+		bucket.drop++
 		s.mu.Unlock()
 
 		// 归还 Task 对象，防止内存泄漏
 		t.Handler = nil
 		taskPool.Put(t)
-		bucket.drop++
 
 		// 可选：记录丢弃日志或上报监控指标
 		// metrics.Incr("proxy.request.drop")
@@ -167,9 +169,16 @@ func (p *SmartPool) processConn(id string, b *Bucket, s *shard) {
 			s.mu.Unlock()
 			continue
 		}
+		// 如果存在 pending drop，不要回收 bucket，否则 drop 会丢失，导致 pipeline 语义错误。
+		if b.drop > 0 {
+			b.running = false
+			s.mu.Unlock()
+			return
+		}
 		delete(s.buckets, id)
 		b.running = false
 		b.id = ""
+		b.drop = 0
 		s.mu.Unlock()
 
 		bucketPool.Put(b)

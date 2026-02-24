@@ -9,10 +9,16 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/panjf2000/gnet/v2"
 )
 
 // TestRandomCommands fills a bunch of random commands and test various
@@ -206,6 +212,71 @@ func TestRandomCommands(t *testing.T) {
 
 func TestServerTCP(t *testing.T) {
 	testServerNetwork(t, "tcp", ":12345")
+}
+
+func TestNewServerTCP_RoundTrip(t *testing.T) {
+	// Use a free local port (best-effort) to avoid collisions.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("split host port: %v", err)
+	}
+	_ = ln.Close()
+	laddr := "127.0.0.1:" + port
+
+	s := NewServer(laddr,
+		func(conn Conn, cmd *Request, res *Respond) {
+			switch strings.ToLower(string(cmd.Args[0].Bytes())) {
+			case "ping":
+				res.WriteString("PONG")
+			default:
+				res.WriteError("ERR unknown command")
+			}
+		},
+		nil, // after
+		nil, // accept
+		nil, // closed
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ListenAndServe()
+	}()
+	defer func() {
+		_ = s.Close(context.Background())
+		<-done
+	}()
+
+	// Dial with retry to avoid flaky startup timing.
+	var c net.Conn
+	for i := 0; i < 50; i++ {
+		c, err = net.Dial("tcp", laddr)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(c, "PING\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	rd := bufio.NewReader(c)
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if line != "+PONG\r\n" {
+		t.Fatalf("expected %q, got %q", "+PONG\r\n", line)
+	}
 }
 
 func TestServerTCP_PartialPacket(t *testing.T) {
@@ -767,5 +838,296 @@ func TestParse(t *testing.T) {
 	}
 	if string(cmd.Args[0].Bytes()) != "A" {
 		t.Fatalf("expected '%v', got '%v'", "A", string(cmd.Args[0].Bytes()))
+	}
+}
+
+// minimalGnetConn is a minimal in-memory implementation of gnet.Conn for unit tests.
+// It only supports what Reader/OnTraffic need in this test (Read + Context + RemoteAddr).
+type minimalGnetConn struct {
+	ctx any
+
+	in  []byte
+	pos int
+
+	remote net.Addr
+
+	mu     sync.Mutex
+	frames [][]byte
+}
+
+func newMinimalGnetConn() *minimalGnetConn {
+	return &minimalGnetConn{
+		remote: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000},
+	}
+}
+
+func (c *minimalGnetConn) appendInbound(p []byte) { c.in = append(c.in, p...) }
+
+func (c *minimalGnetConn) resetFrames() {
+	c.mu.Lock()
+	c.frames = nil
+	c.mu.Unlock()
+}
+
+func (c *minimalGnetConn) getFrames() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([][]byte, len(c.frames))
+	for i := range c.frames {
+		out[i] = append([]byte(nil), c.frames[i]...)
+	}
+	return out
+}
+
+// ---- gnet.Conn ----
+func (c *minimalGnetConn) Context() any              { return c.ctx }
+func (c *minimalGnetConn) SetContext(ctx any)        { c.ctx = ctx }
+func (c *minimalGnetConn) RemoteAddr() net.Addr      { return c.remote }
+func (c *minimalGnetConn) LocalAddr() net.Addr       { return c.remote }
+func (c *minimalGnetConn) EventLoop() gnet.EventLoop { return nil }
+func (c *minimalGnetConn) Wake(cb gnet.AsyncCallback) error {
+	if cb != nil {
+		return cb(c, nil)
+	}
+	return nil
+}
+func (c *minimalGnetConn) CloseWithCallback(cb gnet.AsyncCallback) error {
+	if cb != nil {
+		return cb(c, nil)
+	}
+	return nil
+}
+func (c *minimalGnetConn) Close() error                     { return nil }
+func (c *minimalGnetConn) SetDeadline(time.Time) error      { return nil }
+func (c *minimalGnetConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *minimalGnetConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *minimalGnetConn) Fd() int                          { return 0 }
+func (c *minimalGnetConn) Dup() (int, error)                { return 0, nil }
+func (c *minimalGnetConn) SetReadBuffer(int) error          { return nil }
+func (c *minimalGnetConn) SetWriteBuffer(int) error         { return nil }
+func (c *minimalGnetConn) SetLinger(int) error              { return nil }
+func (c *minimalGnetConn) SetKeepAlivePeriod(time.Duration) error {
+	return nil
+}
+func (c *minimalGnetConn) SetKeepAlive(bool, time.Duration, time.Duration, int) error {
+	return nil
+}
+func (c *minimalGnetConn) SetNoDelay(bool) error { return nil }
+
+// ---- gnet.Reader (unused methods can be stubs) ----
+func (c *minimalGnetConn) Read(p []byte) (int, error) {
+	if c.pos >= len(c.in) {
+		return 0, io.EOF
+	}
+	n := copy(p, c.in[c.pos:])
+	c.pos += n
+	return n, nil
+}
+func (c *minimalGnetConn) WriteTo(w io.Writer) (int64, error) { return 0, io.EOF }
+func (c *minimalGnetConn) Next(int) ([]byte, error)           { return nil, io.ErrShortBuffer }
+func (c *minimalGnetConn) Peek(int) ([]byte, error)           { return nil, io.ErrShortBuffer }
+func (c *minimalGnetConn) Discard(int) (int, error)           { return 0, io.ErrShortBuffer }
+func (c *minimalGnetConn) InboundBuffered() int               { return len(c.in) - c.pos }
+
+// ---- gnet.Writer (unused in this test) ----
+func (c *minimalGnetConn) Write(p []byte) (int, error)                   { return len(p), nil }
+func (c *minimalGnetConn) ReadFrom(r io.Reader) (int64, error)           { return 0, nil }
+func (c *minimalGnetConn) SendTo(buf []byte, addr net.Addr) (int, error) { return len(buf), nil }
+func (c *minimalGnetConn) Writev(bs [][]byte) (int, error)               { return 0, nil }
+func (c *minimalGnetConn) Flush() error                                  { return nil }
+func (c *minimalGnetConn) OutboundBuffered() int                         { return 0 }
+func (c *minimalGnetConn) AsyncWrite(buf []byte, cb gnet.AsyncCallback) error {
+	c.mu.Lock()
+	c.frames = append(c.frames, append([]byte(nil), buf...))
+	c.mu.Unlock()
+	if cb != nil {
+		return cb(c, nil)
+	}
+	return nil
+}
+func (c *minimalGnetConn) AsyncWritev(bs [][]byte, cb gnet.AsyncCallback) error {
+	n := 0
+	for _, b := range bs {
+		n += len(b)
+	}
+	out := make([]byte, 0, n)
+	for _, b := range bs {
+		out = append(out, b...)
+	}
+	c.mu.Lock()
+	c.frames = append(c.frames, out)
+	c.mu.Unlock()
+	if cb != nil {
+		return cb(c, nil)
+	}
+	return nil
+}
+
+func TestOnTraffic_Drop_ReleasesBufferToPool(t *testing.T) {
+	// Disable GC so sync.Pool keeps objects and our allocation counters stay deterministic.
+	prevGC := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(prevGC)
+	prevP := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(prevP)
+
+	// Count how many times chunkPool/smallChunkPool allocate new pages.
+	var bigAllocs atomic.Int32
+	var smallAllocs atomic.Int32
+	prevBigNew := chunkPool.New
+	prevSmallNew := smallChunkPool.New
+	chunkPool.New = func() interface{} {
+		bigAllocs.Add(1)
+		return new(Chunk)
+	}
+	smallChunkPool.New = func() interface{} {
+		smallAllocs.Add(1)
+		return new(SmallChunk)
+	}
+	defer func() {
+		chunkPool.New = prevBigNew
+		smallChunkPool.New = prevSmallNew
+	}()
+
+	pool, err := NewSmartPool(1, 1)
+	if err != nil {
+		t.Fatalf("NewSmartPool: %v", err)
+	}
+	s := newServer()
+	s.workers = pool
+
+	c := newMinimalGnetConn()
+	c_ := &conn{conn: c, rd: NewReader(c)}
+	c.SetContext(c_)
+	id := c.RemoteAddr().String()
+
+	// Block the only worker so the per-conn queue can be filled to capacity.
+	started := make(chan struct{})
+	block := make(chan struct{})
+	if err := s.workers.Submit(id, func(ctx context.Context, drop int) {
+		close(started)
+		<-block
+	}); err != nil {
+		t.Fatalf("submit blocker: %v", err)
+	}
+	<-started
+
+	// Fill the per-conn queue (128).
+	for i := 0; i < 128; i++ {
+		if err := s.workers.Submit(id, func(context.Context, int) {}); err != nil {
+			t.Fatalf("fill submit %d: %v", i, err)
+		}
+	}
+
+	// Now every OnTraffic will parse a command but fail to enqueue -> must Free() buffers.
+	// Use a big argument so cmd.Raw allocates big pages.
+	bigArg := strings.Repeat("a", 1024)
+	iters := 200
+	beforeBig := bigAllocs.Load()
+	beforeSmall := smallAllocs.Load()
+	for i := 0; i < iters; i++ {
+		c.appendInbound([]byte("ECHO " + bigArg + "\r\n"))
+		s.OnTraffic(c)
+	}
+	afterBig := bigAllocs.Load()
+	afterSmall := smallAllocs.Load()
+
+	// If dropped requests are not freed back to the pool, we'd allocate on almost every iteration.
+	// With Free(), we should see only a small constant number of allocations.
+	if got := int(afterBig - beforeBig); got > 10 {
+		t.Fatalf("too many big-page allocations while dropping requests: got %d, want <= 10", got)
+	}
+	if got := int(afterSmall - beforeSmall); got > 10 {
+		t.Fatalf("too many small-page allocations while dropping requests: got %d, want <= 10", got)
+	}
+
+	close(block)
+}
+
+func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
+	const N = 7
+
+	pool, err := NewSmartPool(1, 1)
+	if err != nil {
+		t.Fatalf("NewSmartPool: %v", err)
+	}
+	s := newServer()
+	s.workers = pool
+	s.handler = func(conn Conn, cmd *Request, res *Respond) {
+		res.WriteString("PONG")
+	}
+
+	c := newMinimalGnetConn()
+	c_ := &conn{conn: c, rd: NewReader(c)}
+	c.SetContext(c_)
+	id := c.RemoteAddr().String()
+
+	// Block worker so we can fill the queue to capacity.
+	started := make(chan struct{})
+	block := make(chan struct{})
+	if err := s.workers.Submit(id, func(ctx context.Context, drop int) {
+		close(started)
+		<-block
+	}); err != nil {
+		t.Fatalf("submit blocker: %v", err)
+	}
+	<-started
+
+	// Fill queue to capacity (128) with tasks that will complete once unblocked.
+	var fillWG sync.WaitGroup
+	fillWG.Add(128)
+	for i := 0; i < 128; i++ {
+		if err := s.workers.Submit(id, func(context.Context, int) { fillWG.Done() }); err != nil {
+			t.Fatalf("fill submit %d: %v", i, err)
+		}
+	}
+
+	// Make N requests be dropped (Submit queue full).
+	for i := 0; i < N; i++ {
+		c.appendInbound([]byte("PING\r\n"))
+		s.OnTraffic(c)
+	}
+
+	// Unblock and wait for the 128 fill tasks to drain.
+	close(block)
+	drainDone := make(chan struct{})
+	go func() {
+		fillWG.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for queue drain")
+	}
+
+	// Next accepted request should return N overflow errors, then PONG.
+	c.resetFrames()
+	done := make(chan struct{})
+	s.after = func(conn Conn, cmd *Request, res *Respond) {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+	c.appendInbound([]byte("PING\r\n"))
+	s.OnTraffic(c)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for response")
+	}
+
+	frames := c.getFrames()
+	if len(frames) != N+1 {
+		t.Fatalf("expected %d frames, got %d", N+1, len(frames))
+	}
+	for i := 0; i < N; i++ {
+		if string(frames[i]) != string(ErrQueueOverflow) {
+			t.Fatalf("frame[%d] expected %q, got %q", i, string(ErrQueueOverflow), string(frames[i]))
+		}
+	}
+	if string(frames[N]) != "+PONG\r\n" {
+		t.Fatalf("last frame expected %q, got %q", "+PONG\r\n", string(frames[N]))
 	}
 }
