@@ -1030,7 +1030,7 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 			s.mu.Lock()
 			delete(s.conns, c_)
 			s.mu.Unlock()
-			return []byte(err.Error()), gnet.Close
+			return []byte("-" + err.Error() + "\r\n"), gnet.Close
 		}
 	}
 	c.SetContext(c_)
