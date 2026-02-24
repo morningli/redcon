@@ -1038,8 +1038,11 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
-	c_ := c.Context().(*conn)
-	if s.closed != nil {
+	if s.closed == nil {
+		return
+	}
+	c_, ok := c.Context().(*conn)
+	if ok {
 		s.closed(c_, err)
 	}
 	return
@@ -1051,8 +1054,10 @@ var (
 )
 
 func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
-	c_ := c.Context().(*conn)
-	id := c.RemoteAddr().String()
+	c_, ok := c.Context().(*conn)
+	if !ok {
+		return gnet.Close
+	}
 
 	rec := time.Now()
 	cmds, err := c_.rd.readCommands()
@@ -1098,6 +1103,7 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		}
 	}
 
+	id := c.RemoteAddr().String()
 	if err != nil {
 		err = s.workers.Submit(id, flushDrops, func(ctx context.Context) {
 			if err, ok := err.(*errProtocol); ok {
