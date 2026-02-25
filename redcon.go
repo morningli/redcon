@@ -195,7 +195,13 @@ func (r *Request) Context() interface{} { return r.ctx }
 func (r *Request) SetContext(v interface{}) { r.ctx = v }
 
 // WriteArray 向 Raw 追加一个 Array 头（元素数量为 count）。
-func (r *Request) WriteArray(count int) { AppendArray(r.Raw, count) }
+func (r *Request) WriteArray(count int) {
+	if count < 0 {
+		AppendNullArray(r.Raw)
+		return
+	}
+	AppendArray(r.Raw, count)
+}
 
 // WriteBulk 向 Raw 追加一个 Bulk，并把其 Data 视图追加到 Args。
 func (r *Request) WriteBulk(bulk []byte) {
@@ -426,7 +432,12 @@ func (r *Respond) WriteNull() {
 //	c.WriteBulkString("item 1")
 //	c.WriteBulkString("item 2")
 func (r *Respond) WriteArray(count int) {
-	res := AppendArray(r.Buffer, count)
+	var res RESP
+	if count < 0 {
+		res = AppendNullArray(r.Buffer)
+	} else {
+		res = AppendArray(r.Buffer, count)
+	}
 
 	// 先按照普通规则挂载（如果是根则设为 root，如果是子 Array 则挂到父 Array 下）
 	r.attach(res)

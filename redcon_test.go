@@ -591,6 +591,13 @@ func TestWriter(t *testing.T) {
 	}
 	wr.Reset()
 
+	// Null Array "*-1\r\n"
+	wr.WriteArray(-1)
+	if string(wr.Bytes()) != "*-1\r\n" {
+		t.Fatal("failed")
+	}
+	wr.Reset()
+
 	wr.WriteBulk([]byte("HELLO\r\nPLANET"))
 	if string(wr.Bytes()) != "$13\r\nHELLO\r\nPLANET\r\n" {
 		t.Fatal("failed")

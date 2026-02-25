@@ -500,6 +500,20 @@ func AppendArray(b *Buffer, n int) RESP {
 	}
 }
 
+// AppendNullArray appends a Redis protocol null array "*-1\r\n" to the input bytes.
+func AppendNullArray(b *Buffer) RESP {
+	start := b.Len()
+	_, _ = b.Write([]byte{'*', '-', '1', '\r', '\n'})
+	end := b.Len()
+	return RESP{
+		Type:  Array,
+		Count: -1,
+		Raw:   b.Slice(start, end),
+		Data:  nil,
+		Array: nil,
+	}
+}
+
 // AppendBulk appends a Redis protocol bulk byte slice to the input bytes.
 func AppendBulk(b *Buffer, bulk []byte) RESP {
 	start := b.Len()
@@ -637,7 +651,9 @@ type SimpleInt int
 
 // SimpleError is for representing an error without adding the "ERR" prefix
 // from an *Any call.
-type SimpleError error
+type SimpleError string
+
+func (e SimpleError) Error() string { return string(e) }
 
 // Marshaler is the interface implemented by types that
 // can marshal themselves into a Redis response type from an *Any call.

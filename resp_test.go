@@ -48,6 +48,20 @@ func TestAppendArray(t *testing.T) {
 	}
 }
 
+func TestAppendNullArray(t *testing.T) {
+	b := NewBuffer()
+	resp := AppendNullArray(b)
+	if string(b.Bytes()) != "*-1\r\n" {
+		t.Fatalf("expected %q, got %q", "*-1\r\n", string(b.Bytes()))
+	}
+	if string(resp.Raw.Bytes()) != "*-1\r\n" {
+		t.Fatalf("expected Raw=%q, got %q", "*-1\r\n", string(resp.Raw.Bytes()))
+	}
+	if resp.Type != Array || resp.Count != -1 {
+		t.Fatalf("expected Type=Array Count=-1, got Type=%v Count=%d", resp.Type, resp.Count)
+	}
+}
+
 func TestReadNextRESP_AllTypesAndStructures(t *testing.T) {
 	tests := []struct {
 		name string
