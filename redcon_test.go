@@ -279,6 +279,99 @@ func TestNewServerTCP_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestServer_ShutdownGracefully_MovedAndStops(t *testing.T) {
+	// Use a free local port (best-effort) to avoid collisions.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("split host port: %v", err)
+	}
+	_ = ln.Close()
+	laddr := "127.0.0.1:" + port
+
+	s := NewServer(laddr,
+		func(conn Conn, cmd *Request, res *Respond) {
+			switch strings.ToLower(string(cmd.Args[0].Bytes())) {
+			case "ping":
+				res.WriteString("PONG")
+			default:
+				res.WriteError("ERR unknown command")
+			}
+		},
+		nil, // after
+		nil, // accept
+		nil, // closed
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ListenAndServe()
+	}()
+
+	// Dial with retry to avoid flaky startup timing.
+	var c net.Conn
+	for i := 0; i < 50; i++ {
+		c, err = net.Dial("tcp", laddr)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		_ = s.Close(context.Background())
+		<-done
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	rd := bufio.NewReader(c)
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(c, "PING\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if line != "+PONG\r\n" {
+		t.Fatalf("expected %q, got %q", "+PONG\r\n", line)
+	}
+
+	// Start graceful shutdown with a drain handler that returns MOVED.
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	if err := s.ShutdownGracefully(ctx, func(conn Conn, cmd *Request, res *Respond) {
+		res.WriteError("MOVED 1 127.0.0.1:6380")
+	}); err != nil {
+		t.Fatalf("ShutdownGracefully: %v", err)
+	}
+
+	// Existing connection should now get MOVED replies for new requests within the drain window.
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(c, "PING\r\n"); err != nil {
+		t.Fatalf("write after drain: %v", err)
+	}
+	line, err = rd.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read after drain: %v", err)
+	}
+	if line != "-MOVED 1 127.0.0.1:6380\r\n" {
+		t.Fatalf("expected %q, got %q", "-MOVED 1 127.0.0.1:6380\r\n", line)
+	}
+
+	// Server should stop within a reasonable time after conns drain or deadline.
+	select {
+	case <-time.After(3 * time.Second):
+		_ = s.Close(context.Background())
+		t.Fatalf("timeout waiting for server stop")
+	case <-done:
+	}
+}
+
 func TestServerTCP_PartialPacket(t *testing.T) {
 	// Use a free local port (best-effort) to avoid collisions.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1152,5 +1245,159 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 	}
 	if string(frames[0]) != "+PONG\r\n" {
 		t.Fatalf("expected %q, got %q", "+PONG\r\n", string(frames[0]))
+	}
+}
+
+func TestOnTraffic_CloseAfterFlush_DoesNotTruncatePipeline(t *testing.T) {
+	pool, err := NewSmartPool(1, 1)
+	if err != nil {
+		t.Fatalf("NewSmartPool: %v", err)
+	}
+	s := newServer()
+	s.workers = pool
+
+	var mu sync.Mutex
+	calls := 0
+	done := make(chan struct{})
+
+	// First command requests close, but we must still reply to the second pipelined command.
+	s.handler = func(conn Conn, cmd *Request, res *Respond) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+
+		if n == 1 {
+			res.WriteString("A")
+			_ = conn.Close()
+			return
+		}
+		res.WriteString("B")
+		close(done)
+	}
+
+	c := newMinimalGnetConn()
+	c_ := &conn{conn: c, rd: NewReader(c)}
+	c.SetContext(c_)
+
+	// Two telnet-style commands in one read batch.
+	c.appendInbound([]byte("PING\r\nPING\r\n"))
+	s.OnTraffic(c)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for second handler call")
+	}
+
+	frames := c.getFrames()
+	if len(frames) != 2 {
+		t.Fatalf("expected 2 frames, got %d", len(frames))
+	}
+	if string(frames[0]) != "+A\r\n" {
+		t.Fatalf("expected frame[0]=%q, got %q", "+A\r\n", string(frames[0]))
+	}
+	if string(frames[1]) != "+B\r\n" {
+		t.Fatalf("expected frame[1]=%q, got %q", "+B\r\n", string(frames[1]))
+	}
+	if !c_.closed {
+		t.Fatalf("expected connection to be closed after flushing all pending replies")
+	}
+}
+
+func TestOnTraffic_DrainDeadlineExceeded_StopsProcessingNewRequests(t *testing.T) {
+	pool, err := NewSmartPool(1, 1)
+	if err != nil {
+		t.Fatalf("NewSmartPool: %v", err)
+	}
+	s := newServer()
+	s.workers = pool
+
+	called := atomic.Int32{}
+	s.handler = func(conn Conn, cmd *Request, res *Respond) {
+		called.Add(1)
+		res.WriteString("OK")
+	}
+
+	// Enter drain mode with a deadline in the past.
+	pastCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	_ = s.ShutdownGracefully(pastCtx, func(conn Conn, cmd *Request, res *Respond) {
+		res.WriteError("MOVED 1 127.0.0.1:6380")
+	})
+
+	c := newMinimalGnetConn()
+	c_ := &conn{conn: c, rd: NewReader(c)}
+	c.SetContext(c_)
+	s.mu.Lock()
+	s.conns[c_] = true
+	s.mu.Unlock()
+
+	c.appendInbound([]byte("PING\r\n"))
+	s.OnTraffic(c)
+
+	if called.Load() != 0 {
+		t.Fatalf("expected handler not to be called after drain deadline, got %d", called.Load())
+	}
+	// Connection closing is driven by OnTick (idle conn close) during draining.
+	s.OnTick()
+	if !c_.closed {
+		t.Fatalf("expected connection to be closed by OnTick after drain deadline")
+	}
+	if got := len(c.getFrames()); got != 0 {
+		t.Fatalf("expected no frames written, got %d", got)
+	}
+}
+
+func TestOnTraffic_Draining_UsesDrainHandlerToReturnMoved(t *testing.T) {
+	pool, err := NewSmartPool(1, 1)
+	if err != nil {
+		t.Fatalf("NewSmartPool: %v", err)
+	}
+	s := newServer()
+	s.workers = pool
+
+	var normalCalled atomic.Int32
+	s.handler = func(conn Conn, cmd *Request, res *Respond) {
+		normalCalled.Add(1)
+		res.WriteString("NORMAL")
+	}
+
+	var movedCalled atomic.Int32
+	moveHandler := func(conn Conn, cmd *Request, res *Respond) {
+		movedCalled.Add(1)
+		res.WriteError("MOVED 123 127.0.0.1:6380")
+	}
+
+	// Start draining with a move handler. (Not serving in this unit test is fine.)
+	_ = s.ShutdownGracefully(context.Background(), moveHandler)
+
+	c := newMinimalGnetConn()
+	c_ := &conn{conn: c, rd: NewReader(c)}
+	c.SetContext(c_)
+
+	c.appendInbound([]byte("PING\r\n"))
+	s.OnTraffic(c)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(c.getFrames()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	frames := c.getFrames()
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(frames))
+	}
+	if string(frames[0]) != "-MOVED 123 127.0.0.1:6380\r\n" {
+		t.Fatalf("expected moved frame=%q, got %q", "-MOVED 123 127.0.0.1:6380\r\n", string(frames[0]))
+	}
+	if normalCalled.Load() != 0 {
+		t.Fatalf("expected normal handler not to be called, got %d", normalCalled.Load())
+	}
+	if movedCalled.Load() != 1 {
+		t.Fatalf("expected move handler to be called once, got %d", movedCalled.Load())
 	}
 }
