@@ -1223,14 +1223,17 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		atomic.AddInt32(&c_.pending, 1)
 		err_ := s.workers.Submit(id, flushDrops, func(ctx context.Context) {
 			err_ := c.AsyncWrite([]byte("-ERR "+err.Error()), func(c gnet.Conn, err error) error {
+				atomic.AddInt32(&c_.pending, -1)
 				_ = c_.close()
 				return err
 			})
 			if err_ != nil {
+				atomic.AddInt32(&c_.pending, -1)
 				_ = c_.close()
 			}
 		})
 		if err_ != nil {
+			atomic.AddInt32(&c_.pending, -1)
 			_ = c_.close()
 		}
 		return
@@ -1263,10 +1266,16 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 				}
 				cmd.Free()
 				res.Close()
-				if (err != nil || atomic.LoadUint32(&c_.needClose) == 1) || (atomic.AddInt32(&c_.pending, -1) == 0 && s.Draining()) {
+				atomic.AddInt32(&c_.pending, -1)
+				if err != nil {
+					_ = c_.close()
+					return err
+				}
+				// Once business requests Close(), close after the next successful flush.
+				if atomic.LoadUint32(&c_.needClose) == 1 {
 					_ = c_.close()
 				}
-				return err
+				return nil
 			}
 			if h != nil {
 				err = c.AsyncWritev(res.Data(), callback)
@@ -1276,6 +1285,7 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 			if err != nil {
 				cmd.Free()
 				res.Close()
+				atomic.AddInt32(&c_.pending, -1)
 				_ = c_.close()
 				return
 			}
@@ -1295,7 +1305,6 @@ func (s *Server) OnTick() (delay time.Duration, action gnet.Action) {
 		return
 	}
 
-	// While draining, periodically close idle connections (pending==0).
 	var closers []*conn
 	s.mu.Lock()
 	for c := range s.conns {

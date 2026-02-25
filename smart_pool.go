@@ -3,6 +3,7 @@ package redcon
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"time"
 
@@ -171,6 +172,9 @@ func (p *SmartPool) processConn(id string, b *Bucket, s *shard) {
 		// 4. 配额用尽，异步让出 (逻辑同前)
 		if len(b.tasks) > 0 {
 			go func() {
+				// Yield so other connections that are blocked on workerPool.Submit()
+				// (e.g. starting their first bucket with antsSize=1) can proceed.
+				runtime.Gosched()
 				_ = p.workerPool.Submit(func() { p.processConn(id, b, s) })
 			}()
 			return
