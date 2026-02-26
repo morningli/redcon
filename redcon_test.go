@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/panjf2000/gnet/v2"
+	"github.com/stretchr/testify/require"
 )
 
 // TestRandomCommands fills a bunch of random commands and test various
@@ -1234,7 +1235,7 @@ func TestOnTraffic_Drop_ReleasesBufferToPool(t *testing.T) {
 		smallChunkPool.New = prevSmallNew
 	}()
 
-	pool, err := NewSmartPool(1, 1)
+	pool, err := NewGPerC(1)
 	if err != nil {
 		t.Fatalf("NewSmartPool: %v", err)
 	}
@@ -1242,14 +1243,13 @@ func TestOnTraffic_Drop_ReleasesBufferToPool(t *testing.T) {
 	s.workers = pool
 
 	c := newMinimalGnetConn()
-	c_ := &conn{conn: c, rd: NewReader(c)}
-	c.SetContext(c_)
+	s.OnOpen(c)
 	id := c.RemoteAddr().String()
 
 	// Block the only worker so the per-conn queue can be filled to capacity.
 	started := make(chan struct{})
 	block := make(chan struct{})
-	if err := s.workers.Submit(id, nil, func(ctx context.Context) {
+	if err := s.workers.Submit(context.Background(), id, func(ctx context.Context) {
 		close(started)
 		<-block
 	}); err != nil {
@@ -1259,7 +1259,7 @@ func TestOnTraffic_Drop_ReleasesBufferToPool(t *testing.T) {
 
 	// Fill the per-conn queue (128).
 	for i := 0; i < 128; i++ {
-		if err := s.workers.Submit(id, nil, func(context.Context) {}); err != nil {
+		if err := s.workers.Submit(context.Background(), id, func(context.Context) {}); err != nil {
 			t.Fatalf("fill submit %d: %v", i, err)
 		}
 	}
@@ -1292,7 +1292,7 @@ func TestOnTraffic_Drop_ReleasesBufferToPool(t *testing.T) {
 func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 	const N = 7
 
-	pool, err := NewSmartPool(1, 1)
+	pool, err := NewGPerC(1)
 	if err != nil {
 		t.Fatalf("NewSmartPool: %v", err)
 	}
@@ -1303,14 +1303,13 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 	}
 
 	c := newMinimalGnetConn()
-	c_ := &conn{conn: c, rd: NewReader(c)}
-	c.SetContext(c_)
 	id := c.RemoteAddr().String()
+	s.OnOpen(c)
 
 	// Block worker so we can fill the queue to capacity.
 	started := make(chan struct{})
 	block := make(chan struct{})
-	if err := s.workers.Submit(id, nil, func(ctx context.Context) {
+	if err := s.workers.Submit(context.Background(), id, func(ctx context.Context) {
 		close(started)
 		<-block
 	}); err != nil {
@@ -1322,7 +1321,7 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 	var fillWG sync.WaitGroup
 	fillWG.Add(128)
 	for i := 0; i < 128; i++ {
-		if err := s.workers.Submit(id, nil, func(context.Context) { fillWG.Done() }); err != nil {
+		if err := s.workers.Submit(context.Background(), id, func(context.Context) { fillWG.Done() }); err != nil {
 			t.Fatalf("fill submit %d: %v", i, err)
 		}
 	}
@@ -1395,7 +1394,7 @@ func TestOnTraffic_DropMultiple_ReturnsOrderedErrors(t *testing.T) {
 }
 
 func TestOnTraffic_CloseAfterFlush_ClosesAfterCurrentReply(t *testing.T) {
-	pool, err := NewSmartPool(1, 1)
+	pool, err := NewGPerC(1)
 	if err != nil {
 		t.Fatalf("NewSmartPool: %v", err)
 	}
@@ -1424,8 +1423,8 @@ func TestOnTraffic_CloseAfterFlush_ClosesAfterCurrentReply(t *testing.T) {
 	}
 
 	c := newMinimalGnetConn()
-	c_ := &conn{conn: c, rd: NewReader(c)}
-	c.SetContext(c_)
+	s.OnOpen(c)
+	c_ := c.Context().(*conn)
 
 	// Two telnet-style commands in one read batch.
 	c.appendInbound([]byte("PING\r\nPING\r\n"))
@@ -1450,7 +1449,7 @@ func TestOnTraffic_CloseAfterFlush_ClosesAfterCurrentReply(t *testing.T) {
 }
 
 func TestOnTraffic_DrainDeadlineExceeded_StopsProcessingNewRequests(t *testing.T) {
-	pool, err := NewSmartPool(1, 1)
+	pool, err := NewGPerC(1)
 	if err != nil {
 		t.Fatalf("NewSmartPool: %v", err)
 	}
@@ -1483,7 +1482,7 @@ func TestOnTraffic_DrainDeadlineExceeded_StopsProcessingNewRequests(t *testing.T
 	if called.Load() != 0 {
 		t.Fatalf("expected handler not to be called after drain deadline, got %d", called.Load())
 	}
-	// Connection closing is driven by OnTick (idle conn close) during draining.
+	// Bucket closing is driven by OnTick (idle conn close) during draining.
 	s.OnTick()
 	if !c_.closed {
 		t.Fatalf("expected connection to be closed by OnTick after drain deadline")
@@ -1493,8 +1492,8 @@ func TestOnTraffic_DrainDeadlineExceeded_StopsProcessingNewRequests(t *testing.T
 	}
 }
 
-func TestOnTraffic_Draining_UsesDrainHandlerToReturnMoved(t *testing.T) {
-	pool, err := NewSmartPool(1, 1)
+func TestOnTraffic_Draining_NewOpen(t *testing.T) {
+	pool, err := NewGPerC(1)
 	if err != nil {
 		t.Fatalf("NewSmartPool: %v", err)
 	}
@@ -1514,11 +1513,42 @@ func TestOnTraffic_Draining_UsesDrainHandlerToReturnMoved(t *testing.T) {
 	}
 
 	// Start draining with a move handler. (Not serving in this unit test is fine.)
-	_ = s.ShutdownGracefully(context.Background(), moveHandler)
+	err = s.ShutdownGracefully(context.Background(), moveHandler)
+	require.NoError(t, err)
 
 	c := newMinimalGnetConn()
-	c_ := &conn{conn: c, rd: NewReader(c)}
-	c.SetContext(c_)
+
+	d, act := s.OnOpen(c)
+	require.Equal(t, d, []byte("-ERR server is shutting down\r\n"), d)
+	require.Equal(t, gnet.Close, act)
+}
+
+func TestOnTraffic_Draining_UsesDrainHandlerToReturnMoved(t *testing.T) {
+	pool, err := NewGPerC(1)
+	if err != nil {
+		t.Fatalf("NewSmartPool: %v", err)
+	}
+	s := newServer()
+	s.workers = pool
+
+	var normalCalled atomic.Int32
+	s.handler = func(conn Conn, cmd *Request, res *Respond) {
+		normalCalled.Add(1)
+		res.WriteString("NORMAL")
+	}
+
+	var movedCalled atomic.Int32
+	moveHandler := func(conn Conn, cmd *Request, res *Respond) {
+		movedCalled.Add(1)
+		res.WriteError("MOVED 123 127.0.0.1:6380")
+	}
+
+	c := newMinimalGnetConn()
+	s.OnOpen(c)
+	c_ := c.Context().(*conn)
+
+	err = s.ShutdownGracefully(context.Background(), moveHandler)
+	require.NoError(t, err)
 
 	c.appendInbound([]byte("PING\r\n"))
 	s.OnTraffic(c)
@@ -1544,4 +1574,5 @@ func TestOnTraffic_Draining_UsesDrainHandlerToReturnMoved(t *testing.T) {
 	if movedCalled.Load() != 1 {
 		t.Fatalf("expected move handler to be called once, got %d", movedCalled.Load())
 	}
+	require.Zero(t, c_.pending)
 }

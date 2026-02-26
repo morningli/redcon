@@ -88,6 +88,8 @@ func NewServerNetwork(
 // Close stops listening on the TCP address.
 // Already Accepted connections will be closed.
 func (s *Server) Close(ctx context.Context) error {
+	fmt.Println("Close")
+
 	s.mu.Lock()
 	eg := s.eg
 	if eg == nil {
@@ -112,7 +114,7 @@ func (s *Server) ListenAndServe() error {
 }
 
 func newServer() *Server {
-	p, err := NewSmartPool(1024, 5000)
+	p, err := NewGPerC(128)
 	if err != nil {
 		panic(err)
 	}
@@ -145,6 +147,8 @@ func (s *Server) getDrainHandler() func(conn Conn, cmd *Request, res *Respond) {
 // - periodically checks whether there are remaining connections, or the deadline has passed
 // - calls eg.Stop() when drained or timed out
 func (s *Server) ShutdownGracefully(ctx context.Context, handler func(conn Conn, cmd *Request, res *Respond)) error {
+	fmt.Println("ShutdownGracefully")
+
 	// handler can be nil: when nil, OnTraffic will keep using the normal server handler.
 	s.setDrainHandler(handler)
 
@@ -222,16 +226,15 @@ func ListenAndServeNetwork(
 type conn struct {
 	conn      gnet.Conn
 	rd        *Reader
-	addr      string
+	id        string
 	ctx       interface{}
-	needClose uint32 // atomic: 1 means close-after-flush is requested
+	needClose bool
 	closed    bool
-	idleClose time.Duration
 	pending   int32 // atomic: number of in-flight tasks that will write a response
 }
 
 func (c *conn) Close() error {
-	atomic.StoreUint32(&c.needClose, 1)
+	c.needClose = true
 	return nil
 }
 func (c *conn) close() error {
@@ -306,8 +309,7 @@ type Server struct {
 	draining     uint32       // atomic: 1 means server is draining (no new conns, existing conns will close-after-flush)
 	drainHandler atomic.Value // stores drainHandlerHolder
 	drainUntil   int64        // atomic unix nano timestamp. 0 means no deadline.
-	idleClose    time.Duration
-	workers      *SmartPool
+	workers      *GPerC
 	shutdownOnce sync.Once
 
 	// AcceptError is an optional function used to handle Accept errors.
@@ -1093,15 +1095,8 @@ type ServeMux struct {
 	handlers map[string]Handler
 }
 
-// SetIdleClose will automatically close idle connections after the specified
-// duration. Use zero to disable this feature.
-func (s *Server) SetIdleClose(dur time.Duration) {
-	s.mu.Lock()
-	s.idleClose = dur
-	s.mu.Unlock()
-}
-
 func (s *Server) OnBoot(eng gnet.Engine) (action gnet.Action) {
+	fmt.Println("OnBoot")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.eg = &eng
@@ -1109,20 +1104,22 @@ func (s *Server) OnBoot(eng gnet.Engine) (action gnet.Action) {
 }
 
 func (s *Server) OnShutdown(eng gnet.Engine) {
+	fmt.Println("OnShutdown")
 }
 
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
+	fmt.Println("OnOpen")
 	// If draining, reject new connections. Existing connections will be drained/closed.
 	if s.Draining() {
+		fmt.Println("OnOpen rejected because draining")
 		return []byte("-ERR server is shutting down\r\n"), gnet.Close
 	}
 	c_ := &conn{
 		conn: c,
-		addr: c.RemoteAddr().String(),
+		id:   c.RemoteAddr().String(),
 		rd:   NewReader(c),
 	}
 	s.mu.Lock()
-	c_.idleClose = s.idleClose
 	s.conns[c_] = true
 	s.mu.Unlock()
 
@@ -1136,22 +1133,27 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		}
 	}
 	c.SetContext(c_)
+	s.workers.Register(c_.id, c_)
 	return
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+	fmt.Println("OnClose")
 	// Remove from conn set.
-	if c_, ok := c.Context().(*conn); ok {
-		s.mu.Lock()
-		if s.conns != nil {
-			delete(s.conns, c_)
-		}
-		s.mu.Unlock()
-		if s.closed != nil {
-			s.closed(c_, err)
-		}
+	c_, ok := c.Context().(*conn)
+	if !ok {
+		return gnet.Close
 	}
-	return
+	s.mu.Lock()
+	if s.conns != nil {
+		delete(s.conns, c_)
+	}
+	s.mu.Unlock()
+	if s.closed != nil {
+		s.closed(c_, err)
+	}
+	s.workers.Unregister(c_.id)
+	return gnet.Close
 }
 
 var (
@@ -1160,6 +1162,8 @@ var (
 )
 
 func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
+	fmt.Println("OnTraffic")
+
 	c_, ok := c.Context().(*conn)
 	if !ok {
 		return gnet.Close
@@ -1197,52 +1201,17 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		err = nil
 	}
 
-	flushDrops := func(drop int) {
-		b := NewBuffer()
-		for i := 0; i < drop; i++ {
-			b.Write(ErrQueueOverflow)
-		}
-		werr := c.AsyncWritev(b.Data(), func(c gnet.Conn, err error) error {
-			if err != nil {
-				b.Free()
-				_ = c_.close()
-				return err
-			}
-			b.Free()
-			return nil
-		})
-		if werr != nil {
-			b.Free()
-			_ = c_.close()
-			return
-		}
-	}
-
 	id := c.RemoteAddr().String()
 	if err != nil {
-		atomic.AddInt32(&c_.pending, 1)
-		err_ := s.workers.Submit(id, flushDrops, func(ctx context.Context) {
-			err_ := c.AsyncWrite([]byte("-ERR "+err.Error()), func(c gnet.Conn, err error) error {
-				atomic.AddInt32(&c_.pending, -1)
-				_ = c_.close()
-				return err
-			})
-			if err_ != nil {
-				atomic.AddInt32(&c_.pending, -1)
-				_ = c_.close()
-			}
-		})
-		if err_ != nil {
-			atomic.AddInt32(&c_.pending, -1)
-			_ = c_.close()
-		}
+		s.workers.SubmitError(context.Background(), id, err)
 		return
 	}
 
 	atomic.AddInt32(&c_.pending, int32(len(cmds)))
+
 	for _, cmd_ := range cmds {
 		cmd := cmd_
-		err = s.workers.Submit(id, flushDrops, func(ctx context.Context) {
+		err := s.workers.Submit(context.Background(), id, func(ctx context.Context) {
 			var res = NewRespond()
 			cmd.ReceiveTime = rec
 			cmd.ProcessTime = time.Now()
@@ -1266,16 +1235,11 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 				}
 				cmd.Free()
 				res.Close()
-				atomic.AddInt32(&c_.pending, -1)
-				if err != nil {
-					_ = c_.close()
-					return err
-				}
-				// Once business requests Close(), close after the next successful flush.
-				if atomic.LoadUint32(&c_.needClose) == 1 {
+				pending := atomic.AddInt32(&c_.pending, -1)
+				if err != nil || c_.needClose || (s.Draining() && pending == 0) {
 					_ = c_.close()
 				}
-				return nil
+				return err
 			}
 			if h != nil {
 				err = c.AsyncWritev(res.Data(), callback)
@@ -1299,6 +1263,8 @@ func (s *Server) OnTraffic(c gnet.Conn) (action gnet.Action) {
 }
 
 func (s *Server) OnTick() (delay time.Duration, action gnet.Action) {
+	fmt.Println("OnTick")
+
 	// Default tick interval is low-frequency to minimize overhead.
 	if !s.Draining() {
 		delay = time.Second
@@ -1308,7 +1274,9 @@ func (s *Server) OnTick() (delay time.Duration, action gnet.Action) {
 	var closers []*conn
 	s.mu.Lock()
 	for c := range s.conns {
-		if atomic.LoadInt32(&c.pending) == 0 {
+		pending := atomic.LoadInt32(&c.pending)
+		fmt.Printf("pending:%s=%d\n", c.RemoteAddr().String(), pending)
+		if pending == 0 {
 			closers = append(closers, c)
 		}
 	}
