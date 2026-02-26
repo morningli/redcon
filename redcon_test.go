@@ -1,19 +1,18 @@
 package redcon
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
-	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestRandomCommands fills a bunch of random commands and test various
@@ -159,8 +158,8 @@ func TestRandomCommands(t *testing.T) {
 			}
 			log.Fatal(err)
 		}
-		if len(cmd.Args) == 3 && string(cmd.Args[0]) == "RESET" &&
-			string(cmd.Args[1]) == "THE" && string(cmd.Args[2]) == "INDEX" {
+		if len(cmd.Args) == 3 && string(cmd.Args[0].Bytes()) == "RESET" &&
+			string(cmd.Args[1].Bytes()) == "THE" && string(cmd.Args[2].Bytes()) == "INDEX" {
 			if idx != len(gcmds) {
 				t.Fatalf("did not process all commands")
 			}
@@ -172,10 +171,10 @@ func TestRandomCommands(t *testing.T) {
 		}
 		for i := 0; i < len(cmd.Args); i++ {
 			if i == 0 {
-				if len(cmd.Args[i]) == len(gcmds[idx][i]) {
+				if len(cmd.Args[i].Bytes()) == len(gcmds[idx][i]) {
 					ok := true
-					for j := 0; j < len(cmd.Args[i]); j++ {
-						c1, c2 := cmd.Args[i][j], gcmds[idx][i][j]
+					for j := 0; j < len(cmd.Args[i].Bytes()); j++ {
+						c1, c2 := cmd.Args[i].Bytes()[j], gcmds[idx][i][j]
 						if c1 >= 'A' && c1 <= 'Z' {
 							c1 += 32
 						}
@@ -191,7 +190,7 @@ func TestRandomCommands(t *testing.T) {
 						continue
 					}
 				}
-			} else if string(cmd.Args[i]) == string(gcmds[idx][i]) {
+			} else if string(cmd.Args[i].Bytes()) == string(gcmds[idx][i]) {
 				continue
 			}
 			t.Fatalf("not equal for index %d/%d", idx, i)
@@ -204,53 +203,42 @@ func TestRandomCommands(t *testing.T) {
 		fmt.Printf("%d commands in %s - %.0f ops/sec\n", cnt, dur, float64(cnt)/(float64(dur)/float64(time.Second)))
 	}
 }
-func testDetached(conn DetachedConn) {
-	conn.WriteString("DETACHED")
-	if err := conn.Flush(); err != nil {
-		panic(err)
-	}
-}
+
 func TestServerTCP(t *testing.T) {
 	testServerNetwork(t, "tcp", ":12345")
-}
-func TestServerUnix(t *testing.T) {
-	os.RemoveAll("/tmp/redcon-unix.sock")
-	defer os.RemoveAll("/tmp/redcon-unix.sock")
-	testServerNetwork(t, "unix", "/tmp/redcon-unix.sock")
 }
 
 func testServerNetwork(t *testing.T, network, laddr string) {
 	s := NewServerNetwork(network, laddr,
-		func(conn Conn, cmd Command) {
-			switch strings.ToLower(string(cmd.Args[0])) {
+		func(conn Conn, cmd *Request, res *Respond) {
+			switch strings.ToLower(string(cmd.Args[0].Bytes())) {
 			default:
-				conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
+				res.WriteError("ERR unknown command '" + string(cmd.Args[0].Bytes()) + "'")
 			case "ping":
-				conn.WriteString("PONG")
+				res.WriteString("PONG")
 			case "quit":
-				conn.WriteString("OK")
+				res.WriteString("OK")
 				conn.Close()
-			case "detach":
-				go testDetached(conn.Detach())
 			case "int":
-				conn.WriteInt(100)
+				res.WriteInt(100)
 			case "bulk":
-				conn.WriteBulkString("bulk")
+				res.WriteBulkString("bulk")
 			case "bulkbytes":
-				conn.WriteBulk([]byte("bulkbytes"))
+				res.WriteBulk([]byte("bulkbytes"))
 			case "null":
-				conn.WriteNull()
+				res.WriteNull()
 			case "err":
-				conn.WriteError("ERR error")
+				res.WriteError("ERR error")
 			case "array":
-				conn.WriteArray(2)
-				conn.WriteInt(99)
-				conn.WriteString("Hi!")
+				res.WriteArray(2)
+				res.WriteInt(99)
+				res.WriteString("Hi!")
 			}
 		},
-		func(conn Conn) bool {
+		nil,
+		func(conn Conn) error {
 			//log.Printf("accept: %s", conn.RemoteAddr())
-			return true
+			return nil
 		},
 		func(conn Conn, err error) {
 			//log.Printf("closed: %s [%v]", conn.RemoteAddr(), err)
@@ -261,7 +249,7 @@ func testServerNetwork(t *testing.T, network, laddr string) {
 	}
 	go func() {
 		time.Sleep(time.Second / 4)
-		if err := ListenAndServeNetwork(network, laddr, func(conn Conn, cmd Command) {}, nil, nil); err == nil {
+		if err := ListenAndServeNetwork(network, laddr, func(conn Conn, cmd *Request, res *Respond) {}, nil, nil, nil); err == nil {
 			panic("expected an error, should not be able to listen on the same port")
 		}
 		time.Sleep(time.Second / 4)
@@ -300,61 +288,32 @@ func testServerNetwork(t *testing.T, network, laddr string) {
 			return string(buf[:n]), nil
 		}
 		res, err := do("PING\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != "+PONG\r\n" {
-			panic(fmt.Sprintf("expecting '+PONG\r\n', got '%v'", res))
-		}
+		require.NoError(t, err)
+		require.Equal(t, "+PONG\r\n", res)
+
 		res, err = do("BULK\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != "$4\r\nbulk\r\n" {
-			panic(fmt.Sprintf("expecting bulk, got '%v'", res))
-		}
+		require.NoError(t, err)
+		require.Equal(t, "$4\r\nbulk\r\n", res)
+
 		res, err = do("BULKBYTES\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != "$9\r\nbulkbytes\r\n" {
-			panic(fmt.Sprintf("expecting bulkbytes, got '%v'", res))
-		}
+		require.NoError(t, err)
+		require.Equal(t, "$9\r\nbulkbytes\r\n", res)
+
 		res, err = do("INT\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != ":100\r\n" {
-			panic(fmt.Sprintf("expecting int, got '%v'", res))
-		}
+		require.NoError(t, err)
+		require.Equal(t, ":100\r\n", res)
+
 		res, err = do("NULL\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != "$-1\r\n" {
-			panic(fmt.Sprintf("expecting nul, got '%v'", res))
-		}
+		require.NoError(t, err)
+		require.Equal(t, "$-1\r\n", res)
+
 		res, err = do("ARRAY\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != "*2\r\n:99\r\n+Hi!\r\n" {
-			panic(fmt.Sprintf("expecting array, got '%v'", res))
-		}
+		require.NoError(t, err)
+		require.Equal(t, "*2\r\n:99\r\n+Hi!\r\n", res)
+
 		res, err = do("ERR\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != "-ERR error\r\n" {
-			panic(fmt.Sprintf("expecting array, got '%v'", res))
-		}
-		res, err = do("DETACH\r\n")
-		if err != nil {
-			panic(err)
-		}
-		if res != "+DETACHED\r\n" {
-			panic(fmt.Sprintf("expecting string, got '%v'", res))
-		}
+		require.NoError(t, err)
+		require.Equal(t, "-ERR error\r\n", res)
 	}()
 	go func() {
 		err := s.ListenServeAndSignal(signal)
@@ -372,77 +331,6 @@ func TestConnImpl(t *testing.T) {
 	}
 }
 
-func TestWriteBulkFrom(t *testing.T) {
-	wbuf := &bytes.Buffer{}
-	wr := NewWriter(wbuf)
-	rbuf := &bytes.Buffer{}
-	testStr := "hello world"
-	rbuf.WriteString(testStr)
-	wr.WriteBulkFrom(int64(len(testStr)), rbuf)
-	wr.Flush()
-	if wbuf.String() != fmt.Sprintf("$%d\r\n%s\r\n", len(testStr), testStr) {
-		t.Fatal("failed")
-	}
-	wbuf.Reset()
-	testStr1 := "hi world"
-	rbuf.WriteString(testStr1)
-	wr.WriteBulkFrom(int64(len(testStr1)), rbuf)
-	wr.Flush()
-	if wbuf.String() != fmt.Sprintf("$%d\r\n%s\r\n", len(testStr1), testStr1) {
-		t.Fatal("failed")
-	}
-	wbuf.Reset()
-}
-
-func TestWriter(t *testing.T) {
-	buf := &bytes.Buffer{}
-	wr := NewWriter(buf)
-	wr.WriteError("ERR bad stuff")
-	wr.Flush()
-	if buf.String() != "-ERR bad stuff\r\n" {
-		t.Fatal("failed")
-	}
-	buf.Reset()
-	wr.WriteString("HELLO")
-	wr.Flush()
-	if buf.String() != "+HELLO\r\n" {
-		t.Fatal("failed")
-	}
-	buf.Reset()
-	wr.WriteInt(-1234)
-	wr.Flush()
-	if buf.String() != ":-1234\r\n" {
-		t.Fatal("failed")
-	}
-	buf.Reset()
-	wr.WriteNull()
-	wr.Flush()
-	if buf.String() != "$-1\r\n" {
-		t.Fatal("failed")
-	}
-	buf.Reset()
-	wr.WriteBulk([]byte("HELLO\r\nPLANET"))
-	wr.Flush()
-	if buf.String() != "$13\r\nHELLO\r\nPLANET\r\n" {
-		t.Fatal("failed")
-	}
-	buf.Reset()
-	wr.WriteBulkString("HELLO\r\nPLANET")
-	wr.Flush()
-	if buf.String() != "$13\r\nHELLO\r\nPLANET\r\n" {
-		t.Fatal("failed")
-	}
-	buf.Reset()
-	wr.WriteArray(3)
-	wr.WriteBulkString("THIS")
-	wr.WriteBulkString("THAT")
-	wr.WriteString("THE OTHER THING")
-	wr.Flush()
-	if buf.String() != "*3\r\n$4\r\nTHIS\r\n$4\r\nTHAT\r\n+THE OTHER THING\r\n" {
-		t.Fatal("failed")
-	}
-	buf.Reset()
-}
 func testMakeRawCommands(rawargs [][]string) []string {
 	var rawcmds []string
 	for i := 0; i < len(rawargs); i++ {
@@ -480,15 +368,15 @@ func TestReaderRespRandom(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(cmd.Raw) != rawcmds[i] {
-				t.Fatalf("expected '%v', got '%v'", rawcmds[i], string(cmd.Raw))
+			if string(cmd.Raw.Bytes()) != rawcmds[i] {
+				t.Fatalf("expected '%v', got '%v'", rawcmds[i], string(cmd.Raw.Bytes()))
 			}
 			if len(cmd.Args) != len(rawargs[i]) {
 				t.Fatalf("expected '%v', got '%v'", len(rawargs[i]), len(cmd.Args))
 			}
 			for j := 0; j < len(rawargs[i]); j++ {
-				if string(cmd.Args[j]) != rawargs[i][j] {
-					t.Fatalf("expected '%v', got '%v'", rawargs[i][j], string(cmd.Args[j]))
+				if string(cmd.Args[j].Bytes()) != rawargs[i][j] {
+					t.Fatalf("expected '%v', got '%v'", rawargs[i][j], string(cmd.Args[j].Bytes()))
 				}
 			}
 		}
@@ -527,15 +415,15 @@ func TestPlainReader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(cmd.Raw) != rawres[i] {
-			t.Fatalf("expected '%v', got '%v'", rawres[i], string(cmd.Raw))
+		if string(cmd.Raw.Bytes()) != rawres[i] {
+			t.Fatalf("expected '%v', got '%v'", rawres[i], string(cmd.Raw.Bytes()))
 		}
 		if len(cmd.Args) != len(rawargs[i]) {
 			t.Fatalf("expected '%v', got '%v'", len(rawargs[i]), len(cmd.Args))
 		}
 		for j := 0; j < len(rawargs[i]); j++ {
-			if string(cmd.Args[j]) != rawargs[i][j] {
-				t.Fatalf("expected '%v', got '%v'", rawargs[i][j], string(cmd.Args[j]))
+			if string(cmd.Args[j].Bytes()) != rawargs[i][j] {
+				t.Fatalf("expected '%v', got '%v'", rawargs[i][j], string(cmd.Args[j].Bytes()))
 			}
 		}
 	}
@@ -562,208 +450,26 @@ func TestParse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(cmd.Raw) != "*1\r\n$1\r\nA\r\n" {
-		t.Fatalf("expected '%v', got '%v'", "*1\r\n$1\r\nA\r\n", string(cmd.Raw))
+	if string(cmd.Raw.Bytes()) != "*1\r\n$1\r\nA\r\n" {
+		t.Fatalf("expected '%v', got '%v'", "*1\r\n$1\r\nA\r\n", string(cmd.Raw.Bytes()))
 	}
 	if len(cmd.Args) != 1 {
 		t.Fatalf("expected '%v', got '%v'", 1, len(cmd.Args))
 	}
-	if string(cmd.Args[0]) != "A" {
-		t.Fatalf("expected '%v', got '%v'", "A", string(cmd.Args[0]))
+	if string(cmd.Args[0].Bytes()) != "A" {
+		t.Fatalf("expected '%v', got '%v'", "A", string(cmd.Args[0].Bytes()))
 	}
 	cmd, err = Parse([]byte("A\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(cmd.Raw) != "*1\r\n$1\r\nA\r\n" {
-		t.Fatalf("expected '%v', got '%v'", "*1\r\n$1\r\nA\r\n", string(cmd.Raw))
+	if string(cmd.Raw.Bytes()) != "*1\r\n$1\r\nA\r\n" {
+		t.Fatalf("expected '%v', got '%v'", "*1\r\n$1\r\nA\r\n", string(cmd.Raw.Bytes()))
 	}
 	if len(cmd.Args) != 1 {
 		t.Fatalf("expected '%v', got '%v'", 1, len(cmd.Args))
 	}
-	if string(cmd.Args[0]) != "A" {
-		t.Fatalf("expected '%v', got '%v'", "A", string(cmd.Args[0]))
+	if string(cmd.Args[0].Bytes()) != "A" {
+		t.Fatalf("expected '%v', got '%v'", "A", string(cmd.Args[0].Bytes()))
 	}
-}
-
-func TestPubSub(t *testing.T) {
-	addr := ":12346"
-	done := make(chan bool)
-	go func() {
-		var ps PubSub
-		go func() {
-			tch := time.NewTicker(time.Millisecond * 5)
-			defer tch.Stop()
-			channels := []string{"achan1", "bchan2", "cchan3", "dchan4"}
-			for i := 0; ; i++ {
-				select {
-				case <-tch.C:
-				case <-done:
-					for {
-						var empty bool
-						ps.mu.Lock()
-						if len(ps.conns) == 0 {
-							if ps.chans.Len() != 0 {
-								panic("chans not empty")
-							}
-							empty = true
-						}
-						ps.mu.Unlock()
-						if empty {
-							break
-						}
-						time.Sleep(time.Millisecond * 10)
-					}
-					done <- true
-					return
-				}
-				channel := channels[i%len(channels)]
-				message := fmt.Sprintf("message %d", i)
-				ps.Publish(channel, message)
-			}
-		}()
-		panic(ListenAndServe(addr, func(conn Conn, cmd Command) {
-			switch strings.ToLower(string(cmd.Args[0])) {
-			default:
-				conn.WriteError("ERR unknown command '" +
-					string(cmd.Args[0]) + "'")
-			case "publish":
-				if len(cmd.Args) != 3 {
-					conn.WriteError("ERR wrong number of arguments for '" +
-						string(cmd.Args[0]) + "' command")
-					return
-				}
-				count := ps.Publish(string(cmd.Args[1]), string(cmd.Args[2]))
-				conn.WriteInt(count)
-			case "subscribe", "psubscribe":
-				if len(cmd.Args) < 2 {
-					conn.WriteError("ERR wrong number of arguments for '" +
-						string(cmd.Args[0]) + "' command")
-					return
-				}
-				command := strings.ToLower(string(cmd.Args[0]))
-				for i := 1; i < len(cmd.Args); i++ {
-					if command == "psubscribe" {
-						ps.Psubscribe(conn, string(cmd.Args[i]))
-					} else {
-						ps.Subscribe(conn, string(cmd.Args[i]))
-					}
-				}
-			}
-		}, nil, nil))
-	}()
-
-	final := make(chan bool)
-	go func() {
-		select {
-		case <-time.Tick(time.Second * 30):
-			panic("timeout")
-		case <-final:
-			return
-		}
-	}()
-
-	// create 10 connections
-	var wg sync.WaitGroup
-	wg.Add(10)
-	for i := 0; i < 10; i++ {
-		go func(i int) {
-			defer wg.Done()
-			var conn net.Conn
-			for i := 0; i < 5; i++ {
-				var err error
-				conn, err = net.Dial("tcp", addr)
-				if err != nil {
-					time.Sleep(time.Second / 10)
-					continue
-				}
-			}
-			if conn == nil {
-				panic("could not connect to server")
-			}
-			defer conn.Close()
-
-			regs := make(map[string]int)
-			var maxp int
-			var maxs int
-			fmt.Fprintf(conn, "subscribe achan1\r\n")
-			fmt.Fprintf(conn, "subscribe bchan2 cchan3\r\n")
-			fmt.Fprintf(conn, "psubscribe a*1\r\n")
-			fmt.Fprintf(conn, "psubscribe b*2 c*3\r\n")
-
-			// collect 50 messages from each channel
-			rd := bufio.NewReader(conn)
-			var buf []byte
-			for {
-				line, err := rd.ReadBytes('\n')
-				if err != nil {
-					panic(err)
-				}
-				buf = append(buf, line...)
-				n, resp := ReadNextRESP(buf)
-				if n == 0 {
-					continue
-				}
-				buf = nil
-				if resp.Type != Array {
-					panic("expected array")
-				}
-				var vals []RESP
-				resp.ForEach(func(item RESP) bool {
-					vals = append(vals, item)
-					return true
-				})
-
-				name := string(vals[0].Data)
-				switch name {
-				case "subscribe":
-					if len(vals) != 3 {
-						panic("invalid count")
-					}
-					ch := string(vals[1].Data)
-					regs[ch] = 0
-					maxs, _ = strconv.Atoi(string(vals[2].Data))
-				case "psubscribe":
-					if len(vals) != 3 {
-						panic("invalid count")
-					}
-					ch := string(vals[1].Data)
-					regs[ch] = 0
-					maxp, _ = strconv.Atoi(string(vals[2].Data))
-				case "message":
-					if len(vals) != 3 {
-						panic("invalid count")
-					}
-					ch := string(vals[1].Data)
-					regs[ch] = regs[ch] + 1
-				case "pmessage":
-					if len(vals) != 4 {
-						panic("invalid count")
-					}
-					ch := string(vals[1].Data)
-					regs[ch] = regs[ch] + 1
-				}
-				if len(regs) == 6 && maxp == 3 && maxs == 3 {
-					ready := true
-					for _, count := range regs {
-						if count < 50 {
-							ready = false
-							break
-						}
-					}
-					if ready {
-						// all messages have been received
-						return
-					}
-				}
-			}
-		}(i)
-	}
-	wg.Wait()
-	// notify sender
-	done <- true
-	// wait for sender
-	<-done
-	// stop the timeout
-	final <- true
 }
