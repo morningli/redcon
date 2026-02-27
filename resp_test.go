@@ -50,15 +50,9 @@ func TestAppendArray(t *testing.T) {
 
 func TestAppendNullArray(t *testing.T) {
 	b := NewBuffer()
-	resp := AppendNullArray(b)
+	AppendNullArray(b)
 	if string(b.Bytes()) != "*-1\r\n" {
 		t.Fatalf("expected %q, got %q", "*-1\r\n", string(b.Bytes()))
-	}
-	if string(resp.Raw.Bytes()) != "*-1\r\n" {
-		t.Fatalf("expected Raw=%q, got %q", "*-1\r\n", string(resp.Raw.Bytes()))
-	}
-	if resp.Type != Array || resp.Count != -1 {
-		t.Fatalf("expected Type=Array Count=-1, got Type=%v Count=%d", resp.Type, resp.Count)
 	}
 }
 
@@ -266,21 +260,6 @@ func TestGetArrayLength(t *testing.T) {
 			t.Fatalf("expected error, got nil")
 		}
 	})
-}
-
-func TestAppendNull_Structure(t *testing.T) {
-	b := NewBuffer()
-	resp := AppendNull(b)
-	if resp.Type != Bulk {
-		t.Fatalf("expected Type=Bulk, got %v", resp.Type)
-	}
-	// AppendNull uses "$-1\r\n"
-	if string(resp.Raw.Bytes()) != "$-1\r\n" {
-		t.Fatalf("expected Raw=%q, got %q", "$-1\r\n", string(resp.Raw.Bytes()))
-	}
-	if resp.Data != nil {
-		t.Fatalf("expected Data=nil for null bulk, got %q", string(resp.Data.Bytes()))
-	}
 }
 
 func TestReadNextRESP_ConsumesOnlyOneMessage(t *testing.T) {

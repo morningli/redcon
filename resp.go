@@ -462,115 +462,54 @@ func appendPrefix(b *Buffer, c byte, n int64) {
 }
 
 // AppendUint appends a Redis protocol uint64 to the input bytes.
-func AppendUint(b *Buffer, n uint64) RESP {
-	start := b.Len()
+func AppendUint(b *Buffer, n uint64) {
 	_, _ = b.Write([]byte{':'})
 	_, _ = b.Write(strconv.AppendUint(nil, n, 10))
 	_, _ = b.Write([]byte{'\r', '\n'})
-	end := b.Len()
-	return RESP{
-		Type: Integer,
-		Raw:  b.Slice(start, end),
-		Data: b.Slice(start+1, end-2), // 排除 ':' 和 '\r\n'
-	}
 }
 
 // AppendInt appends a Redis protocol int64 to the input bytes.
-func AppendInt(b *Buffer, n int64) RESP {
-	start := b.Len()
+func AppendInt(b *Buffer, n int64) {
 	appendPrefix(b, ':', n)
-	end := b.Len()
-	return RESP{
-		Type: Integer,
-		Raw:  b.Slice(start, end),
-		Data: b.Slice(start+1, end-2), // 排除 ':' 和 '\r\n'
-	}
 }
 
 // AppendArray appends a Redis protocol array to the input bytes.
-func AppendArray(b *Buffer, n int) RESP {
-	start := b.Len()
+func AppendArray(b *Buffer, n int) {
 	appendPrefix(b, '*', int64(n))
-	end := b.Len()
-	return RESP{
-		Type:  Array,
-		Count: n,
-		Raw:   b.Slice(start, end),
-		Array: make([]RESP, 0, n), // 预分配子元素空间
-	}
 }
 
 // AppendNullArray appends a Redis protocol null array "*-1\r\n" to the input bytes.
-func AppendNullArray(b *Buffer) RESP {
-	start := b.Len()
+func AppendNullArray(b *Buffer) {
 	_, _ = b.Write([]byte{'*', '-', '1', '\r', '\n'})
-	end := b.Len()
-	return RESP{
-		Type:  Array,
-		Count: -1,
-		Raw:   b.Slice(start, end),
-		Data:  nil,
-		Array: nil,
-	}
 }
 
 // AppendBulk appends a Redis protocol bulk byte slice to the input bytes.
-func AppendBulk(b *Buffer, bulk []byte) RESP {
-	start := b.Len()
+func AppendBulk(b *Buffer, bulk []byte) *BufferView {
 	appendPrefix(b, '$', int64(len(bulk)))
-	headerEnd := b.Len()
-
+	beg := b.Len()
 	_, _ = b.Write(bulk)
-	dataEnd := b.Len()
-	_, _ = b.Write([]byte{'\r', '\n'})
 	end := b.Len()
-
-	return RESP{
-		Type:  Bulk,
-		Count: len(bulk),
-		Raw:   b.Slice(start, end),
-		Data:  b.Slice(headerEnd, dataEnd), // 仅指向数据主体
-	}
+	_, _ = b.Write([]byte{'\r', '\n'})
+	return b.Slice(beg, end)
 }
 
 // AppendBulkString appends a Redis protocol bulk string to the input bytes.
-func AppendBulkString(b *Buffer, bulk string) RESP {
-	return AppendBulk(b, []byte(bulk))
+func AppendBulkString(b *Buffer, bulk string) {
+	AppendBulk(b, []byte(bulk))
 }
 
 // AppendString appends a Redis protocol string to the input bytes.
-func AppendString(b *Buffer, s string) RESP {
-	// 1. 记录起始物理位移
-	start := b.Len()
-
-	// 2. 执行物理写入 (利用内存池 Buffer)
+func AppendString(b *Buffer, s string) {
 	_, _ = b.Write([]byte{'+'})
 	_, _ = b.Write([]byte(stripNewlines(s)))
 	_, _ = b.Write([]byte{'\r', '\n'})
-
-	// 3. 获取当前总长度
-	end := b.Len()
-
-	// 4. 返回逻辑结构
-	return RESP{
-		Type: String, // 即 '+'
-		Raw:  b.Slice(start, end),
-		Data: b.Slice(start+1, end-2), // 排除前缀 '+' 和末尾 '\r\n'
-	}
 }
 
 // AppendError appends a Redis protocol error to the input bytes.
-func AppendError(b *Buffer, s string) RESP {
-	start := b.Len()
+func AppendError(b *Buffer, s string) {
 	_, _ = b.Write([]byte{'-'})
 	_, _ = b.Write([]byte(stripNewlines(s)))
 	_, _ = b.Write([]byte{'\r', '\n'})
-	end := b.Len()
-	return RESP{
-		Type: Error,
-		Raw:  b.Slice(start, end),
-		Data: b.Slice(start+1, end-2),
-	}
 }
 
 // AppendOK appends a Redis protocol OK to the input bytes.
@@ -590,7 +529,7 @@ func stripNewlines(s string) string {
 }
 
 // AppendTile38 appends a Tile38 message to the input bytes.
-func AppendTile38(b Buffer, data []byte) {
+func AppendTile38(b *Buffer, data []byte) {
 	_, _ = b.Write([]byte{'$'})
 	_, _ = b.Write(strconv.AppendInt(nil, int64(len(data)), 10))
 	_, _ = b.Write([]byte{' '})
@@ -599,30 +538,23 @@ func AppendTile38(b Buffer, data []byte) {
 }
 
 // AppendNull appends a Redis protocol null to the input bytes.
-func AppendNull(b *Buffer) RESP {
-	start := b.Len()
+func AppendNull(b *Buffer) {
 	_, _ = b.Write([]byte{'$', '-', '1', '\r', '\n'})
-	end := b.Len()
-	return RESP{
-		Type:  Bulk,
-		Count: -1,
-		Raw:   b.Slice(start, end),
-	}
 }
 
 // AppendBulkFloat appends a float64, as bulk bytes.
-func AppendBulkFloat(b *Buffer, f float64) RESP {
-	return AppendBulk(b, strconv.AppendFloat(nil, f, 'f', -1, 64))
+func AppendBulkFloat(b *Buffer, f float64) {
+	AppendBulk(b, strconv.AppendFloat(nil, f, 'f', -1, 64))
 }
 
 // AppendBulkInt appends an int64, as bulk bytes.
-func AppendBulkInt(b *Buffer, x int64) RESP {
-	return AppendBulk(b, strconv.AppendInt(nil, x, 10))
+func AppendBulkInt(b *Buffer, x int64) {
+	AppendBulk(b, strconv.AppendInt(nil, x, 10))
 }
 
 // AppendBulkUint appends an uint64, as bulk bytes.
-func AppendBulkUint(b *Buffer, x uint64) RESP {
-	return AppendBulk(b, strconv.AppendUint(nil, x, 10))
+func AppendBulkUint(b *Buffer, x uint64) {
+	AppendBulk(b, strconv.AppendUint(nil, x, 10))
 }
 
 func prefixERRIfNeeded(msg string) string {
@@ -676,97 +608,70 @@ type Marshaler interface {
 //	SimpleInt       -> integer
 //	Marshaler       -> raw bytes
 //	everything-else -> bulk-string representation using fmt.Sprint()
-func AppendAny(b *Buffer, v interface{}) RESP {
+func AppendAny(b *Buffer, v interface{}) {
 	switch v := v.(type) {
 	case SimpleString:
-		return AppendString(b, string(v))
+		AppendString(b, string(v))
 	case SimpleInt:
-		return AppendInt(b, int64(v))
+		AppendInt(b, int64(v))
 	case SimpleError:
-		return AppendError(b, v.Error())
+		AppendError(b, v.Error())
 	case nil:
-		return AppendNull(b)
+		AppendNull(b)
 	case error:
-		return AppendError(b, prefixERRIfNeeded(v.Error()))
+		AppendError(b, prefixERRIfNeeded(v.Error()))
 	case string:
-		return AppendBulkString(b, v)
+		AppendBulkString(b, v)
 	case []byte:
 		if v == nil {
-			return AppendNull(b)
+			AppendNull(b)
 		} else {
-			return AppendBulk(b, v)
+			AppendBulk(b, v)
 		}
 	case bool:
 		if v {
-			return AppendBulkString(b, "1")
+			AppendBulkString(b, "1")
 		} else {
-			return AppendBulkString(b, "0")
+			AppendBulkString(b, "0")
 		}
 	case int:
-		return AppendBulkInt(b, int64(v))
+		AppendBulkInt(b, int64(v))
 	case int8:
-		return AppendBulkInt(b, int64(v))
+		AppendBulkInt(b, int64(v))
 	case int16:
-		return AppendBulkInt(b, int64(v))
+		AppendBulkInt(b, int64(v))
 	case int32:
-		return AppendBulkInt(b, int64(v))
+		AppendBulkInt(b, int64(v))
 	case int64:
-		return AppendBulkInt(b, int64(v))
+		AppendBulkInt(b, int64(v))
 	case uint:
-		return AppendBulkUint(b, uint64(v))
+		AppendBulkUint(b, uint64(v))
 	case uint8:
-		return AppendBulkUint(b, uint64(v))
+		AppendBulkUint(b, uint64(v))
 	case uint16:
-		return AppendBulkUint(b, uint64(v))
+		AppendBulkUint(b, uint64(v))
 	case uint32:
-		return AppendBulkUint(b, uint64(v))
+		AppendBulkUint(b, uint64(v))
 	case uint64:
-		return AppendBulkUint(b, uint64(v))
+		AppendBulkUint(b, uint64(v))
 	case float32:
-		return AppendBulkFloat(b, float64(v))
+		AppendBulkFloat(b, float64(v))
 	case float64:
-		return AppendBulkFloat(b, float64(v))
+		AppendBulkFloat(b, float64(v))
 	case Marshaler:
-		start := b.Len()
-		data := v.MarshalRESP()
-		_, _ = b.Write(data)
-		end := b.Len()
-
-		// 获取写入数据的视图
-		view := b.Slice(start, end)
-		// 调用原型：func ReadNextRESP(b *BufferView) (n int, resp RESP)
-		// 这样可以准确识别 Marshaler 产生的 RESP 类型 (如 Array 或 Bulk)
-		n, resp := ReadNextRESP(view)
-		if resp.Type == 0 || n == 0 {
-			// 解析失败降级处理：视为原始 Bulk 或错误
-			return RESP{Type: Type(data[0]), Raw: view, Data: view}
-		}
-		return resp
+		_, _ = b.Write(v.MarshalRESP())
 	default:
 		vv := reflect.ValueOf(v)
 		switch vv.Kind() {
 		case reflect.Slice:
 			n := vv.Len()
-			start := b.Len()
-			headerResp := AppendArray(b, n)
-			childResps := make([]RESP, 0, n)
+			AppendArray(b, n)
 			for i := 0; i < n; i++ {
-				childResps = append(childResps, AppendAny(b, vv.Index(i).Interface()))
-			}
-			end := b.Len()
-			return RESP{
-				Type:  Array,
-				Count: n,
-				Raw:   b.Slice(start, end),
-				Data:  b.Slice(headerResp.Raw.Len(), end), // Data 为 header 之后的部分
-				Array: childResps,
+				AppendAny(b, vv.Index(i).Interface())
 			}
 		case reflect.Map:
 			n := vv.Len()
-			start := b.Len()
-			headerResp := AppendArray(b, n*2)
-			childResps := make([]RESP, 0, n*2)
-
+			AppendArray(b, n*2)
 			var i int
 			var strKey bool
 			var strsKeyItems []strKeyItem
@@ -785,8 +690,8 @@ func AppendAny(b *Buffer, v interface{}) RESP {
 						key.(string), iter.Value().Interface(),
 					}
 				} else {
-					childResps = append(childResps, AppendAny(b, key))
-					childResps = append(childResps, AppendAny(b, iter.Value().Interface()))
+					AppendAny(b, key)
+					AppendAny(b, iter.Value().Interface())
 				}
 				i++
 			}
@@ -795,23 +700,14 @@ func AppendAny(b *Buffer, v interface{}) RESP {
 					return strsKeyItems[i].key < strsKeyItems[j].key
 				})
 				for _, item := range strsKeyItems {
-					childResps = append(childResps, AppendBulkString(b, item.key))
-					childResps = append(childResps, AppendAny(b, item.value))
-				}
-				end := b.Len()
-				return RESP{
-					Type:  Array,
-					Count: n * 2,
-					Raw:   b.Slice(start, end),
-					Data:  b.Slice(headerResp.Raw.Len(), end),
-					Array: childResps,
+					AppendBulkString(b, item.key)
+					AppendAny(b, item.value)
 				}
 			}
 		default:
-			return AppendBulkString(b, fmt.Sprint(v))
+			AppendBulkString(b, fmt.Sprint(v))
 		}
 	}
-	return RESP{}
 }
 
 type strKeyItem struct {
