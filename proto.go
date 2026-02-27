@@ -297,3 +297,12 @@ func (r *Respond) Reset() {
 	r.Buffer.Free()
 	r.Buffer = NewBuffer()
 }
+
+func (r *Respond) Type() Type {
+	return GetType(r.Buffer)
+}
+
+func (r *Respond) GetResp() RESP {
+	_, resp := ReadNextRESP(r.Buffer.Tail(0))
+	return resp
+}
