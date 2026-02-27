@@ -244,7 +244,7 @@ func serve(s *Server) error {
 				delete(s.conns, c)
 				s.mu.Unlock()
 				res := NewRespond()
-				res.WriteError("ERR " + err.Error())
+				res.WriteError(err.Error())
 				chunks := net.Buffers(res.Data())
 				_, err = chunks.WriteTo(c.conn)
 				res.Free()
@@ -327,7 +327,8 @@ func handle(s *Server, c *conn) {
 				// client has been detached
 				return errDetached
 			}
-			if c.closed {
+			if c.needClose {
+				_ = c.close()
 				return nil
 			}
 		}
@@ -344,6 +345,7 @@ type conn struct {
 	closed    bool
 	cmds      []*Request
 	idleClose time.Duration
+	needClose bool
 }
 
 func (c *conn) LocalAddr() string {
@@ -351,6 +353,10 @@ func (c *conn) LocalAddr() string {
 }
 
 func (c *conn) Close() error {
+	c.needClose = true
+	return nil
+}
+func (c *conn) close() error {
 	c.closed = true
 	return c.conn.Close()
 }
