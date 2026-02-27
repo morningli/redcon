@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"time"
 )
@@ -52,6 +53,14 @@ func (r *Request) WriteBulk(bulk []byte) {
 // WriteRaw 直接向 Raw 追加字节（不做解析）。
 func (r *Request) WriteRaw(data []byte) { _, _ = r.Raw.Write(data) }
 
+func (r *Request) WriteTo(wr io.Writer) (int64, error) {
+	if r.Raw.Len() == 0 {
+		return 0, io.EOF
+	}
+	chunks := net.Buffers(r.Raw.Data())
+	return chunks.WriteTo(wr)
+}
+
 // Parse parses a raw RESP message and returns a command.
 func Parse(raw []byte) (*Request, error) {
 	complete, args, _, leftover, err := ReadNextCommand(raw, nil)
@@ -98,25 +107,20 @@ func (r *Respond) Bytes() []byte {
 	return r.Buffer.Bytes()
 }
 
-// ReadRESP 从 rd 中读取下一个完整的 RESP 报文。
+// ReadFrom 从 rd 中读取下一个完整的 RESP 报文。
 // 仅在 Buffer 为空时有效，解析结果填充 Buffer 并维护内部 RESP 结构。
-func (r *Respond) ReadRESP(rd io.Reader) error {
+func (r *Respond) ReadFrom(rd io.Reader) (int64, error) {
 	if r.Buffer.Len() > 0 {
-		return errors.New("ReadRESP: buffer must be empty")
+		return 0, errors.New("ReadFrom: buffer must be empty")
 	}
-
-	err := r.decodeStream(rd)
-	if err != nil {
-		return err
-	}
-	return nil
+	return r.decodeStream(rd)
 }
 
-func (r *Respond) decodeStream(rd io.Reader) error {
+func (r *Respond) decodeStream(rd io.Reader) (n int64, err error) {
 	// 1. 读取前缀
 	prefixBuf := make([]byte, 1)
 	if _, err := io.ReadFull(rd, prefixBuf); err != nil {
-		return err
+		return 0, err
 	}
 	r.Buffer.Write(prefixBuf)
 
@@ -126,58 +130,58 @@ func (r *Respond) decodeStream(rd io.Reader) error {
 		// 2. 读取到行尾，获取视图
 		_, err := r.readUntilCRLF(rd)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		return nil
+		return int64(r.Buffer.Len()), nil
 	case Bulk:
 		// 1. 读取长度行视图
 		lenLineView, err := r.readUntilCRLF(rd)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		// 解析长度 (利用 BufferView 的 Bytes() 临时转 string 转换，或直接解析 ASCII)
 		n, err := strconv.Atoi(string(lenLineView.Slice(0, lenLineView.Len()-2).Bytes()))
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		if n == -1 { // Null Bulk String "$-1\r\n"
-			return nil
+			return int64(r.Buffer.Len()), nil
 		}
 
 		// 2. 读取主体数据 n + 2 字节 (\r\n)
 		// 使用适配器流式灌入物理 Buffer
 		if _, err := io.CopyN(r.Buffer, rd, int64(n+2)); err != nil {
-			return err
+			return 0, err
 		}
-		return nil
+		return int64(r.Buffer.Len()), nil
 	case Array:
 		// 1. 读取数量行视图
 		countLineView, err := r.readUntilCRLF(rd)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		count, err := strconv.Atoi(string(countLineView.Slice(0, countLineView.Len()-2).Bytes()))
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		if count <= 0 { // *0\r\n 或 *-1\r\n
-			return nil
+			return int64(r.Buffer.Len()), nil
 		}
 
 		// 2. 递归读取子元素
 		for i := 0; i < count; i++ {
-			err := r.decodeStream(rd)
+			_, err := r.decodeStream(rd)
 			if err != nil {
-				return err
+				return 0, err
 			}
 		}
-		return nil
+		return int64(r.Buffer.Len()), nil
 
 	default:
-		return fmt.Errorf("invalid resp type: %c", prefix)
+		return 0, fmt.Errorf("invalid resp type: %c", prefix)
 	}
 }
 
@@ -194,8 +198,7 @@ func (r *Respond) readUntilCRLF(rd io.Reader) (*BufferView, error) {
 		}
 
 		// 写入物理 Buffer (内存池)
-		r.Buffer.Write(currByte)
-
+		_, _ = r.Buffer.Write(currByte)
 		if lastByte == '\r' && currByte[0] == '\n' {
 			break
 		}
