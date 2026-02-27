@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -92,7 +93,12 @@ func (s *Server) Close() error {
 		return errors.New("not serving")
 	}
 	s.done = true
-	return s.ln.Close()
+	err := s.ln.Close()
+	if err != nil {
+		return err
+	}
+	s.SetDraining(time.Second * 10)
+	return nil
 }
 
 // ListenAndServe serves incoming connections.
@@ -201,6 +207,29 @@ func (s *Server) Serve(ln net.Listener) error {
 func serve(s *Server) error {
 	defer func() {
 		s.ln.Close()
+		draining := s.GetDrainDeadline()
+		dur := draining - time.Now().Unix()
+		if dur > 0 {
+			wait := make(chan struct{})
+			go func() {
+				defer close(wait)
+				t := time.NewTicker(time.Millisecond * 50)
+				defer t.Stop()
+				for range t.C {
+					empty := false
+					s.mu.Lock()
+					empty = len(s.conns) == 0
+					s.mu.Unlock()
+					if empty {
+						break
+					}
+				}
+			}()
+			select {
+			case <-wait:
+			case <-time.After(time.Duration(dur) * time.Second):
+			}
+		}
 		func() {
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -279,11 +308,19 @@ func handle(s *Server, c *conn) {
 	}()
 
 	err = func() error {
+		draining := int64(0)
 		// read commands and feed back to the client
 		for {
+			if draining == 0 {
+				draining = s.GetDrainDeadline()
+			}
 			// read pipeline commands
-			if c.idleClose != 0 {
-				c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
+			if c.idleClose != 0 || draining > 0 {
+				d := time.Now().Add(c.idleClose)
+				if d.Unix() > draining {
+					d = time.Unix(draining, 0)
+				}
+				_ = c.conn.SetReadDeadline(d)
 			}
 			cmds, err := c.rd.readCommands(nil)
 			if err != nil {
@@ -307,6 +344,11 @@ func handle(s *Server, c *conn) {
 				} else {
 					c.cmds = c.cmds[1:]
 				}
+				if draining > 0 && time.Now().Unix() > draining {
+					cmd.Free()
+					_, _ = c.conn.Write([]byte("-ERR Server is shutting down\r\n"))
+					continue
+				}
 				cmd.ReceiveTime = beg
 				cmd.ProcessTime = time.Now()
 				res := NewRespond()
@@ -320,6 +362,9 @@ func handle(s *Server, c *conn) {
 					return err
 				}
 				cmd.FlushTime = time.Now()
+				if s.after != nil {
+					s.after(c, cmd, res)
+				}
 				cmd.Free()
 				res.Free()
 			}
@@ -377,17 +422,18 @@ func (c *conn) NetConn() net.Conn {
 
 // Server defines a server for clients for managing client connections.
 type Server struct {
-	mu        sync.Mutex
-	net       string
-	laddr     string
-	handler   func(conn Conn, cmd *Request, res *Respond)
-	after     func(conn Conn, cmd *Request, res *Respond)
-	accept    func(conn Conn) error
-	closed    func(conn Conn, err error)
-	conns     map[*conn]bool
-	ln        net.Listener
-	done      bool
-	idleClose time.Duration
+	mu            sync.Mutex
+	net           string
+	laddr         string
+	handler       func(conn Conn, cmd *Request, res *Respond)
+	after         func(conn Conn, cmd *Request, res *Respond)
+	accept        func(conn Conn) error
+	closed        func(conn Conn, err error)
+	conns         map[*conn]bool
+	ln            net.Listener
+	done          bool
+	idleClose     time.Duration
+	drainDeadline int64 //unix timestamp
 
 	// AcceptError is an optional function used to handle Accept errors.
 	AcceptError func(err error)
@@ -405,4 +451,21 @@ func (s *Server) SetIdleClose(dur time.Duration) {
 	s.mu.Lock()
 	s.idleClose = dur
 	s.mu.Unlock()
+}
+
+func (s *Server) SetDraining(dur time.Duration) {
+	old := atomic.LoadInt64(&s.drainDeadline)
+	if old > 0 {
+		return
+	}
+	atomic.CompareAndSwapInt64(&s.drainDeadline, old, time.Now().Add(dur).Unix())
+}
+
+func (s *Server) IsDraining() bool {
+	old := atomic.LoadInt64(&s.drainDeadline)
+	return old > 0
+}
+
+func (s *Server) GetDrainDeadline() int64 {
+	return atomic.LoadInt64(&s.drainDeadline)
 }

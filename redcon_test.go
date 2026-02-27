@@ -473,3 +473,37 @@ func TestParse(t *testing.T) {
 		t.Fatalf("expected '%v', got '%v'", "A", string(cmd.Args[0].Bytes()))
 	}
 }
+
+func TestConn_CloseWaitDraining(t *testing.T) {
+	s := NewServerNetwork("tcp", ":0",
+		func(conn Conn, cmd *Request, res *Respond) {
+			time.Sleep(time.Second * 2)
+			res.WriteString(string(cmd.Args[0].Bytes()))
+		}, nil, nil, nil)
+	go func() {
+		err := s.ListenAndServe()
+		t.Logf("server is quit:%s\n", err.Error())
+	}()
+	time.AfterFunc(time.Second, func() {
+		err := s.Close()
+		require.NoError(t, err)
+	})
+	time.Sleep(time.Millisecond * 100)
+
+	c, err := net.Dial("tcp", s.Addr().String())
+	require.NoError(t, err)
+
+	req := []byte("*1\r\n$4\r\ntest\r\n")
+
+	_, err = c.Write(req)
+	require.NoError(t, err)
+	var buf [1024]byte
+	n, err := c.Read(buf[:])
+	require.NoError(t, err)
+	require.Equal(t, []byte("+test\r\n"), buf[:n])
+
+	_, err = c.Write(req)
+	require.NoError(t, err)
+	n, err = c.Read(buf[:])
+	require.Error(t, err)
+}
