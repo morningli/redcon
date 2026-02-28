@@ -1,6 +1,7 @@
 package redcon
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -109,14 +110,14 @@ func (r *Respond) Bytes() []byte {
 
 // ReadFrom 从 rd 中读取下一个完整的 RESP 报文。
 // 仅在 Buffer 为空时有效，解析结果填充 Buffer 并维护内部 RESP 结构。
-func (r *Respond) ReadFrom(rd io.Reader) (int64, error) {
+func (r *Respond) ReadFrom(rd *bufio.Reader) (int64, error) {
 	if r.Buffer.Len() > 0 {
 		return 0, errors.New("ReadFrom: buffer must be empty")
 	}
 	return r.decodeStream(rd)
 }
 
-func (r *Respond) decodeStream(rd io.Reader) (n int64, err error) {
+func (r *Respond) decodeStream(rd *bufio.Reader) (n int64, err error) {
 	// 1. 读取前缀
 	prefixBuf := make([]byte, 1)
 	if _, err := io.ReadFull(rd, prefixBuf); err != nil {
@@ -186,26 +187,41 @@ func (r *Respond) decodeStream(rd io.Reader) (n int64, err error) {
 }
 
 // readUntilCRLF 从 rd 读取数据直到 \r\n，同步写入物理 Buffer，并返回这一行的视图。
-func (r *Respond) readUntilCRLF(rd io.Reader) (*BufferView, error) {
+func (r *Respond) readUntilCRLF(rd *bufio.Reader) (*BufferView, error) {
 	start := r.Buffer.Len()
-	var lastByte byte
-	currByte := make([]byte, 1)
 
 	for {
-		_, err := io.ReadFull(rd, currByte)
+		// 1. 直接搜寻下一个 \n
+		line, err := rd.ReadSlice('\n')
 		if err != nil {
+			if err == bufio.ErrBufferFull {
+				r.Buffer.Write(line)
+				continue
+			}
 			return nil, err
 		}
 
-		// 写入物理 Buffer (内存池)
-		_, _ = r.Buffer.Write(currByte)
-		if lastByte == '\r' && currByte[0] == '\n' {
-			break
+		// 2. 拿到这部分数据后，先写进物理 Buffer
+		r.Buffer.Write(line)
+
+		// 3. 核心优化：只需判断新写入部分的最后一个字节的前一个字符
+		// 因为 ReadSlice 保证了 line 的最后一个字节是 '\n'
+		currLen := r.Buffer.Len()
+
+		// 边界检查：如果整行只有一个 '\n' (currLen-start == 1)，
+		// 则需要看上一次循环存入 Buffer 的最后一个字节是不是 '\r'
+		if currLen-start >= 2 {
+			// 直接取 Buffer 倒数第二个字节进行判断
+			// 假设 r.Buffer.At(index) 是高效的字节访问方法
+			if r.Buffer.At(currLen-2) == '\r' {
+				break // 确认为 \r\n 结尾，大功告成
+			}
 		}
-		lastByte = currByte[0]
+
+		// 如果不是 \r，说明这只是个普通的 \n，继续循环找下一个 \n
+		continue
 	}
 
-	// 返回这一行的视图 (包含 \r\n)
 	return r.Buffer.Slice(start, r.Buffer.Len()), nil
 }
 

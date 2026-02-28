@@ -2,6 +2,7 @@ package redcon
 
 import (
 	"bytes"
+	"github.com/stretchr/testify/require"
 	"testing"
 )
 
@@ -379,4 +380,53 @@ func TestReadNextRESP_ArrayNested_Structure(t *testing.T) {
 	if last.Type != Bulk || last.String() != "bar" {
 		t.Fatalf("expected last=$bar, got Type=%v String=%q", last.Type, last.String())
 	}
+}
+
+func TestGetType(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		b := NewBuffer()
+		ty := GetType(b)
+		require.Zero(t, ty)
+		b.Free()
+	})
+
+	t.Run("String", func(t *testing.T) {
+		b := NewBuffer()
+		AppendString(b, "foo")
+		ty := GetType(b)
+		require.Equal(t, String, ty)
+		b.Free()
+	})
+
+	t.Run("Bulk", func(t *testing.T) {
+		b := NewBuffer()
+		AppendBulk(b, []byte("foo"))
+		ty := GetType(b)
+		require.Equal(t, Bulk, ty)
+		b.Free()
+	})
+
+	t.Run("Error", func(t *testing.T) {
+		b := NewBuffer()
+		AppendError(b, "foo")
+		ty := GetType(b)
+		require.Equal(t, Error, ty)
+		b.Free()
+	})
+
+	t.Run("Array", func(t *testing.T) {
+		b := NewBuffer()
+		AppendNullArray(b)
+		ty := GetType(b)
+		require.Equal(t, Array, ty)
+		b.Free()
+	})
+
+	t.Run("Integer", func(t *testing.T) {
+		b := NewBuffer()
+		AppendInt(b, 1)
+		ty := GetType(b)
+		require.Equal(t, Integer, ty)
+		b.Free()
+	})
 }

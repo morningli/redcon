@@ -24,7 +24,7 @@ const (
 // GetType 返回 b 首字节对应的 RESP 类型标记；b 为空时返回 0。
 func GetType(b *Buffer) Type {
 	if b.Len() == 0 {
-		return 0
+		return Type(0)
 	}
 	return Type(b.At(0))
 }

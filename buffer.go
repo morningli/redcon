@@ -80,10 +80,7 @@ func atByte(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset int,
 		if physicalOff < SmallChunkSize {
 			return small[physicalOff]
 		}
-		off2 := physicalOff - SmallChunkSize
-		pageIdx := off2 >> bigShift
-		innerOff := off2 & bigMask
-		return big[pageIdx][innerOff]
+		physicalOff -= SmallChunkSize
 	}
 	pageIdx := physicalOff >> bigShift
 	innerOff := physicalOff & bigMask

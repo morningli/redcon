@@ -206,3 +206,24 @@ func TestBuffer_Split_BigOnly_RemainderSuffixNeedsBig(t *testing.T) {
 	rem.Free()
 	buf.Free()
 }
+
+var payload = [100]byte{}
+
+func BenchmarkBuffer_Write(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		buf := NewBuffer()
+		for j := 0; j < 200; j++ {
+			_, _ = buf.Write(payload[:])
+		}
+		buf.Free()
+	}
+}
+
+func BenchmarkBuffer_SliceWrite(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		var buf []byte
+		for j := 0; j < 200; j++ {
+			buf = append(buf, payload[:]...)
+		}
+	}
+}
