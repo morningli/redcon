@@ -125,21 +125,19 @@ func fastParseInt(p BufferView) (int, error) {
 	var negate bool
 	var n int64
 
-	raws := p.Data()
+	raw := p.Bytes()
 
-	if raws[0][0] == '-' {
+	if raw[0] == '-' {
 		negate = true
-		raws[0] = raws[0][1:]
+		raw = raw[1:]
 	}
 
-	for _, bs := range raws {
-		for _, b := range bs {
-			if b < '0' || b > '9' {
-				return 0, errors.New("redis: ERR illegal bytes in length")
-			}
-			n *= 10
-			n += int64(b - '0')
+	for _, b := range raw {
+		if b < '0' || b > '9' {
+			return 0, errors.New("redis: ERR illegal bytes in length")
 		}
+		n *= 10
+		n += int64(b - '0')
 	}
 
 	if negate {
