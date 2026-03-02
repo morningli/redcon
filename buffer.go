@@ -1,9 +1,9 @@
 package redcon
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
-	"io"
 	"sync"
 )
 
@@ -588,24 +588,26 @@ func (b *Buffer) Advance(n int) {
 	b.length += n
 }
 
-// ReadFrom 实现 io.ReaderFrom，可用于零拷贝网络读入
-func (b *Buffer) ReadFrom(r io.Reader) (int64, error) {
-	var total int64
-	for {
-		// 每次预留一页空间
-		dest := b.Reserve(ChunkSize)
-		nr, err := r.Read(dest)
+// ReadFull 直接从 bufio.Reader 灌入，绕过 io.Reader 接口
+func (b *Buffer) ReadFull(rd *bufio.Reader, n int) error {
+	b.ensureCapacity(n)
+
+	read := 0
+	for read < n {
+		// 获取当前页剩余的连续物理空间
+		dest := b.Reserve(n - read)
+
+		// 关键点：直接调用结构体方法，消除 assertI2I2 耗时
+		nr, err := rd.Read(dest)
 		if nr > 0 {
 			b.Advance(nr)
-			total += int64(nr)
+			read += nr
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return total, nil // graceful EOF
-			}
-			return total, err
+			return err
 		}
 	}
+	return nil
 }
 
 // BufferView 是对 IndexedBuffer 部分片段的只读视图。

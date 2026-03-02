@@ -383,6 +383,23 @@ func TestFastParseInt_Simple(t *testing.T) {
 	}
 }
 
+func TestDecodeStream_DeepArray(t *testing.T) {
+	// 構造一個嵌套 Array: *2\r\n$3\r\nGET\r\n*1\r\n$4\r\nINFO\r\n
+	data := []byte("*2\r\n$3\r\nGET\r\n*1\r\n$4\r\nINFO\r\n")
+	rd := bufio.NewReader(bytes.NewReader(data))
+	r := &Respond{Buffer: NewBuffer()}
+
+	err := r.decodeStream(rd)
+	if err != nil {
+		t.Fatalf("解析失敗: %v", err)
+	}
+
+	// 驗證 Buffer 最終內容
+	if string(r.Buffer.Bytes()) != string(data) {
+		t.Errorf("內容不一致\n期望: %q\n得到: %q", data, r.Buffer.Bytes())
+	}
+}
+
 func BenchmarkRespond_ReadFrom(b *testing.B) {
 	buf := bytes.NewBuffer(nil)
 	buf.WriteString("*200\r\n")

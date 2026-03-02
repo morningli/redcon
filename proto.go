@@ -181,7 +181,7 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 
 		// 2. 读取主体数据 n + 2 字节 (\r\n)
 		// 使用适配器流式灌入物理 Buffer
-		if _, err := io.CopyN(r.Buffer, rd, int64(n+2)); err != nil {
+		if err := r.Buffer.ReadFull(rd, n+2); err != nil {
 			return err
 		}
 		return nil
