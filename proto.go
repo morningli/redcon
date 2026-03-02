@@ -214,43 +214,44 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 	}
 }
 
-// readUntilCRLF 从 rd 读取数据直到 \r\n，同步写入物理 Buffer，并返回这一行的视图。
 func (r *Respond) readUntilCRLF(rd *bufio.Reader) (BufferView, error) {
 	start := r.Buffer.Len()
+	found := false
 
-	for {
-		// 1. 直接搜寻下一个 \n
+	for !found {
+		// 1. 直接寻找下一个 '\n'
 		line, err := rd.ReadSlice('\n')
 		if err != nil {
 			if err == bufio.ErrBufferFull {
-				_, _ = r.Buffer.Write(line)
+				// 缓冲器满了还沒找到 \n，必须先存入 Buffer 并继续
+				r.Buffer.Write(line)
 				continue
 			}
 			return BufferView{}, err
 		}
-
-		// 2. 拿到这部分数据后，先写进物理 Buffer
 		_, _ = r.Buffer.Write(line)
 
-		// 3. 核心优化：只需判断新写入部分的最后一个字节的前一个字符
-		// 因为 ReadSlice 保证了 line 的最后一个字节是 '\n'
-		currLen := r.Buffer.Len()
-
-		// 边界检查：如果整行只有一个 '\n' (currLen-start == 1)，
-		// 则需要看上一次循环存入 Buffer 的最后一个字节是不是 '\r'
-		if currLen-start >= 2 {
-			// 直接取 Buffer 倒数第二个字节进行判断
-			// 假设 r.Buffer.At(index) 是高效的字节访问方法
-			if r.Buffer.At(currLen-2) == '\r' {
-				break // 确认为 \r\n 结尾，大功告成
+		// 2. 拿到 line，最后一个字节保证是 '\n'
+		n := len(line)
+		if n >= 2 && line[n-2] == '\r' {
+			// 情況 A：\r\n 都在这一次 ReadSlice 的结果中 (最常见)
+			found = true
+		} else if n == 1 {
+			// 情況 B：这一次只拿到 '\n'，需要看 r.Buffer 刚才存入的最后一個字节
+			// 只有当前 Buffer 已有数据时才检查
+			currLen := r.Buffer.Len()
+			if currLen > 0 && r.Buffer.At(currLen-2) == '\r' {
+				found = true
+			} else {
+				// 普通 \n，继续
 			}
+		} else {
+			// 情況 C：拿到了一段以 \n 结尾但前面不是 \r 的数据
 		}
-
-		// 如果不是 \r，说明这只是个普通的 \n，继续循环找下一个 \n
-		continue
 	}
 
-	return r.Buffer.Slice(start, r.Buffer.Len()), nil
+	// 返回这一行的视图
+	return r.Buffer.Tail(start), nil
 }
 
 // WriteNull writes a null to the client

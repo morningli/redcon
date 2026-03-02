@@ -369,14 +369,14 @@ func testParseBulk(br *bufio.Reader) ([]byte, error) {
 }
 
 func TestFastParseInt_Simple(t *testing.T) {
-	// 模擬一個 BufferView (單頁 Fast-Path 覆蓋)
+	// 模拟一個 BufferView (单页 Fast-Path 覆盖)
 	small := &SmallChunk{}
 	copy(small[10:], "-12345")
 	v := BufferView{hasSmall: true, small: small, firstPageOffset: 10, length: 6}
 
 	val, err := fastParseInt(v)
 	if err != nil {
-		t.Fatalf("解析失敗: %v", err)
+		t.Fatalf("解析失败: %v", err)
 	}
 	if val != -12345 {
 		t.Errorf("期望 -12345, 得到 %d", val)
@@ -419,5 +419,30 @@ func BenchmarkRespond_ReadFrom2(b *testing.B) {
 		rd := NewTestReader(reader)
 		_, err := rd.Parse()
 		require.NoError(b, err)
+	}
+}
+
+func TestReadUntilCRLF_Boundary(t *testing.T) {
+	// 构造一個模拟的 bufio.Reader
+	// 数据： "FIRST\r" 然后是 "\nSECOND\r\n"
+	data := []byte("FIRST\r\n")
+	rd := bufio.NewReaderSize(bytes.NewReader(data), 6) // 故意设小缓冲区
+
+	r := &Respond{Buffer: NewBuffer()}
+
+	view, err := r.readUntilCRLF(rd)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	// 验证內容
+	res := view.Bytes()
+	if string(res) != "FIRST\r\n" {
+		t.Errorf("期望 FIRST\\r\\n, 得到 %q", string(res))
+	}
+
+	// 验证 Buffer 长度
+	if r.Buffer.Len() != 7 {
+		t.Errorf("Buffer 长度错误: %d", r.Buffer.Len())
 	}
 }
