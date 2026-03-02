@@ -15,7 +15,7 @@ type Request struct {
 	// Raw is a encoded RESP message.
 	Raw *Buffer
 	// Args is a series of arguments that make up the command.
-	Args []*BufferView
+	Args []BufferView
 
 	ReceiveTime     time.Time
 	ProcessTime     time.Time
@@ -117,7 +117,7 @@ func (r *Respond) ReadFrom(rd *bufio.Reader) (int64, error) {
 }
 
 // parseInt parses an integer reply.
-func fastParseInt(p *BufferView) (int, error) {
+func fastParseInt(p BufferView) (int, error) {
 	if p.Len() == 0 {
 		return 0, errors.New("redis: ERR malformed integer")
 	}
@@ -217,7 +217,7 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 }
 
 // readUntilCRLF 从 rd 读取数据直到 \r\n，同步写入物理 Buffer，并返回这一行的视图。
-func (r *Respond) readUntilCRLF(rd *bufio.Reader) (*BufferView, error) {
+func (r *Respond) readUntilCRLF(rd *bufio.Reader) (BufferView, error) {
 	start := r.Buffer.Len()
 
 	for {
@@ -228,7 +228,7 @@ func (r *Respond) readUntilCRLF(rd *bufio.Reader) (*BufferView, error) {
 				_, _ = r.Buffer.Write(line)
 				continue
 			}
-			return nil, err
+			return BufferView{}, err
 		}
 
 		// 2. 拿到这部分数据后，先写进物理 Buffer
@@ -276,7 +276,7 @@ func (r *Respond) WriteArray(count int) {
 }
 
 // WriteBulk writes bulk bytes to the client.
-func (r *Respond) WriteBulk(bulk []byte) *BufferView {
+func (r *Respond) WriteBulk(bulk []byte) BufferView {
 	return AppendBulk(r.Buffer, bulk)
 }
 

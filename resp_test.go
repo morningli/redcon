@@ -94,11 +94,11 @@ func TestReadNextRESP_AllTypesAndStructures(t *testing.T) {
 				t.Fatalf("expected Raw=%q, got %q", tt.raw, string(resp.Raw.Bytes()))
 			}
 			if tt.dataIsNil {
-				if resp.Data != nil {
+				if !resp.Null {
 					t.Fatalf("expected Data=nil, got %q", string(resp.Data.Bytes()))
 				}
 			} else {
-				if resp.Data == nil {
+				if resp.Null {
 					t.Fatalf("expected Data non-nil")
 				}
 				if string(resp.Data.Bytes()) != tt.data {

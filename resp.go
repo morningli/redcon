@@ -45,10 +45,11 @@ func GetArrayLength(b *Buffer) (int, error) {
 // RESP 表示一次解析后的 RESP 消息结构。
 type RESP struct {
 	Type  Type
-	Raw   *BufferView
-	Data  *BufferView
+	Raw   BufferView
+	Data  BufferView
 	Array []RESP
 	Count int
+	Null  bool
 }
 
 // ForEach iterates over each Array element
@@ -136,7 +137,7 @@ func (r RESP) Exists() bool {
 
 // ReadNextRESP returns the next resp in b and returns the number of bytes the
 // took up the result.
-func ReadNextRESP(b *BufferView) (n int, resp RESP) {
+func ReadNextRESP(b BufferView) (n int, resp RESP) {
 	if b.Len() == 0 {
 		return 0, RESP{} // no data to read
 	}
@@ -193,7 +194,8 @@ func ReadNextRESP(b *BufferView) (n int, resp RESP) {
 			return 0, RESP{} // invalid number of bytes
 		}
 		if resp.Count < 0 {
-			resp.Data = nil
+			resp.Data = BufferView{}
+			resp.Null = true
 			resp.Count = 0
 			return resp.Raw.Len(), resp
 		}
@@ -484,7 +486,7 @@ func AppendNullArray(b *Buffer) {
 }
 
 // AppendBulk appends a Redis protocol bulk byte slice to the input bytes.
-func AppendBulk(b *Buffer, bulk []byte) *BufferView {
+func AppendBulk(b *Buffer, bulk []byte) BufferView {
 	appendPrefix(b, '$', int64(len(bulk)))
 	beg := b.Len()
 	_, _ = b.Write(bulk)

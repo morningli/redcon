@@ -199,7 +199,7 @@ func (rd *Reader) readCommands(leftover *int) ([]*Request, error) {
 							b.Swap(b_)
 							cmd.Raw.Swap(b_)
 						}
-						cmd.Args = make([]*BufferView, len(marks)/2)
+						cmd.Args = make([]BufferView, len(marks)/2)
 						// slice up the raw command into the args based on
 						// the recorded marks.
 						for h := 0; h < len(marks); h += 2 {

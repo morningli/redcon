@@ -15,7 +15,8 @@ const (
 	// ChunkSize 表示大页（Chunk）的字节大小。
 	ChunkSize = 1 << bigShift
 	// bigMask 用于等价替代 `% ChunkSize`。
-	bigMask = 1<<bigShift - 1
+	bigMask          = 1<<bigShift - 1
+	initBigPageCount = 8
 )
 
 // 注意：Buffer 采用“第一页小页、后续大页”的策略：
@@ -66,7 +67,12 @@ type Buffer struct {
 }
 
 // NewBuffer 创建一个空 Buffer。
-func NewBuffer() *Buffer { return &Buffer{hasSmall: true} }
+func NewBuffer() *Buffer {
+	return &Buffer{
+		hasSmall: true,
+		big:      make([]*Chunk, 0, initBigPageCount),
+	}
+}
 
 func min(a, b int) int {
 	if a < b {
@@ -88,19 +94,95 @@ func atByte(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset int,
 	return big[pageIdx][innerOff]
 }
 
+func dataSlice(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset, length int) []byte {
+	if length <= 0 {
+		return nil
+	}
+
+	// --- 1. 快速路径：判断是否为单页连续数据 (0 分配) ---
+	if hasSmall {
+		// 数据完全在 SmallChunk 内部 (0 ~ 255)
+		if firstPageOffset+length <= SmallChunkSize {
+			return small[firstPageOffset : firstPageOffset+length]
+		}
+	} else if len(big) > 0 {
+		// 数据完全在第一个 BigChunk 内部 (0 ~ 4095)
+		if firstPageOffset+length <= ChunkSize {
+			return big[0][firstPageOffset : firstPageOffset+length]
+		}
+	}
+
+	// --- 2. 慢速路径：跨页场景 (必须分配并合并) ---
+	// 此时 pprof 中的 mallocgc 无法避免，但仅在处理大包或极端跨页时触发
+	res := make([]byte, length)
+	remaining := length
+	currOff := firstPageOffset
+	destOff := 0
+
+	// 处理 SmallChunk 剩余部分
+	if hasSmall {
+		canRead := SmallChunkSize - currOff
+		actualRead := min(canRead, remaining)
+		copy(res[destOff:], small[currOff:currOff+actualRead])
+
+		remaining -= actualRead
+		destOff += actualRead
+		currOff = 0 // 后续 BigChunk 从 0 开始读
+	}
+
+	// 顺序拷贝 BigChunks
+	for i := 0; i < len(big) && remaining > 0; i++ {
+		start := currOff
+		canRead := ChunkSize - start
+		actualRead := min(canRead, remaining)
+		copy(res[destOff:], big[i][start:start+actualRead])
+
+		remaining -= actualRead
+		destOff += actualRead
+		currOff = 0
+	}
+
+	return res
+}
+
 func dataSlices(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset, length int) [][]byte {
 	if length <= 0 {
 		return nil
 	}
 
-	result := make([][]byte, 0, 1+len(big))
 	remaining := length
 	currOff := firstPageOffset
 
-	// Optional small first page.
-	if hasSmall && small == nil {
-		return nil
+	// --- 核心优化：精确计算需要的切片数量 ---
+	needed := 0
+	tmpRemaining := length
+	tmpOff := firstPageOffset
+
+	if hasSmall {
+		canRead := SmallChunkSize - tmpOff
+		actualRead := min(canRead, tmpRemaining)
+		needed++
+		tmpRemaining -= actualRead
+		tmpOff = 0
 	}
+
+	if tmpRemaining > 0 {
+		// 计算跨越了多少个 Big Page
+		// 第一页能读多少
+		firstBigCanRead := ChunkSize - tmpOff
+		if tmpRemaining <= firstBigCanRead {
+			needed++
+		} else {
+			// 剩余长度 / 每页长度，向上取整
+			needed += 1 + (tmpRemaining-firstBigCanRead+ChunkSize-1)/ChunkSize
+		}
+	}
+
+	// 此时 make 的 capacity 是精确的，且对于小包（1-2页），needed 会很小
+	// 编译器更容易对这种小规模分配进行优化
+	result := make([][]byte, 0, needed)
+
+	// --- 后续逻辑保持不变，确保正确性 ---
 	if hasSmall {
 		canRead := SmallChunkSize - currOff
 		actualRead := min(canRead, remaining)
@@ -109,9 +191,8 @@ func dataSlices(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset,
 		currOff = 0
 	}
 
-	// Big pages: shared loop for both hasSmall==true/false.
 	for i := 0; i < len(big) && remaining > 0; i++ {
-		start := currOff // only non-zero for the first big page when hasSmall==false
+		start := currOff
 		canRead := ChunkSize - start
 		actualRead := min(canRead, remaining)
 		result = append(result, big[i][start:start+actualRead])
@@ -121,10 +202,11 @@ func dataSlices(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset,
 	return result
 }
 
-func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalStart, length int) *BufferView {
+//go:inline
+func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalStart, length int) BufferView {
 	if hasSmall {
 		if physicalStart < SmallChunkSize {
-			return &BufferView{
+			return BufferView{
 				hasSmall:        true,
 				small:           small,
 				big:             big,
@@ -135,10 +217,10 @@ func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalS
 		off2 := physicalStart - SmallChunkSize
 		startBigIdx := off2 >> bigShift
 		newFirstOff := off2 & bigMask
-		return &BufferView{
+		return BufferView{
 			hasSmall:        false,
 			small:           nil,
-			big:             big[startBigIdx:],
+			big:             big[startBigIdx:], // 仅拷贝切片头(24字节)，不重分配底层数组
 			length:          length,
 			firstPageOffset: newFirstOff,
 		}
@@ -146,7 +228,7 @@ func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalS
 
 	startBigIdx := physicalStart >> bigShift
 	newFirstOff := physicalStart & bigMask
-	return &BufferView{
+	return BufferView{
 		hasSmall:        false,
 		small:           nil,
 		big:             big[startBigIdx:],
@@ -220,7 +302,7 @@ func (b *Buffer) Write(p []byte) (int, error) {
 // Slice 模拟 Go 原生切片操作 b[n:m]
 // n: 起始位移 (inclusive)
 // m: 结束位移 (exclusive)
-func (b *Buffer) Slice(n, m int) *BufferView {
+func (b *Buffer) Slice(n, m int) BufferView {
 	if n < 0 || m < n || m > b.length {
 		panic(fmt.Errorf("index out of range [%d:%d] with length %d", n, m, b.length))
 	}
@@ -231,7 +313,7 @@ func (b *Buffer) Slice(n, m int) *BufferView {
 }
 
 // Tail 返回从 n 到末尾的视图，等价于 Go 切片 b[n:].
-func (b *Buffer) Tail(n int) *BufferView {
+func (b *Buffer) Tail(n int) BufferView {
 	return b.Slice(n, b.Len())
 }
 
@@ -424,14 +506,7 @@ func (b *Buffer) Swap(other *Buffer) {
 // Bytes 将视图内容合并为一个连续的切片（涉及内存拷贝）
 // 建议仅在必须对接只接收 []byte 的第三方 API 时使用
 func (b *Buffer) Bytes() []byte {
-	res := make([]byte, b.length)
-	slices := b.Data()
-	off := 0
-	for _, s := range slices {
-		copy(res[off:], s)
-		off += len(s)
-	}
-	return res
+	return dataSlice(b.hasSmall, b.small, b.big, b.firstPageOffset, b.length)
 }
 
 // ensureCapacity 确保至少还能写 n 字节（自动扩容多页）
@@ -551,17 +626,17 @@ type BufferView struct {
 }
 
 // Len 返回视图的逻辑数据长度
-func (v *BufferView) Len() int {
+func (v BufferView) Len() int {
 	return v.length
 }
 
 // IsEmpty 返回视图是否为空
-func (v *BufferView) IsEmpty() bool {
+func (v BufferView) IsEmpty() bool {
 	return v.length == 0
 }
 
 // At 支持随机访问，返回逻辑索引 index 处的字节
-func (v *BufferView) At(index int) byte {
+func (v BufferView) At(index int) byte {
 	if index < 0 || index >= v.length {
 		panic("view index out of range")
 	}
@@ -570,25 +645,18 @@ func (v *BufferView) At(index int) byte {
 
 // Data 将视图转换为不连续的字节切片列表
 // 常用于 net.Buffers 或 writev 系统调用
-func (v *BufferView) Data() [][]byte {
+func (v BufferView) Data() [][]byte {
 	return dataSlices(v.hasSmall, v.small, v.big, v.firstPageOffset, v.length)
 }
 
-// Bytes 将视图内容合并为一个连续的切片（涉及内存拷贝）
-// 建议仅在必须对接只接收 []byte 的第三方 API 时使用
-func (v *BufferView) Bytes() []byte {
-	res := make([]byte, v.length)
-	slices := v.Data()
-	off := 0
-	for _, s := range slices {
-		copy(res[off:], s)
-		off += len(s)
-	}
-	return res
+// Bytes 将视图内容转换为连续的切片。
+// 优化：针对单页场景返回底层引用（0 拷贝），仅在跨页时执行分配与合并。
+func (v BufferView) Bytes() []byte {
+	return dataSlice(v.hasSmall, v.small, v.big, v.firstPageOffset, v.length)
 }
 
 // Slice 在当前视图基础上再次切片 v[n:m]
-func (v *BufferView) Slice(n, m int) *BufferView {
+func (v BufferView) Slice(n, m int) BufferView {
 	if n < 0 || m < n || m > v.length {
 		panic(fmt.Errorf("view index out of range [%d:%d] with length %d", n, m, v.length))
 	}
@@ -599,7 +667,7 @@ func (v *BufferView) Slice(n, m int) *BufferView {
 }
 
 // Tail 返回从 n 到末尾的视图，等价于 Go 切片 v[n:].
-func (v *BufferView) Tail(n int) *BufferView {
+func (v BufferView) Tail(n int) BufferView {
 	return v.Slice(n, v.Len())
 }
 
