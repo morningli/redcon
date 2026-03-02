@@ -3,6 +3,7 @@ package redcon
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -169,18 +170,12 @@ func makeSuffixFirstPage(suffix []byte) (hasSmall bool, small *SmallChunk, big [
 	return false, nil, []*Chunk{nb}, firstOff
 }
 
-// Write 向 Buffer 末尾追加数据
 func (b *Buffer) Write(p []byte) (int, error) {
 	total := len(p)
 	srcOff := 0
 
-	// If this is the very first write and it's already larger than the small page,
-	// start with a big page and skip allocating the small page.
-	if b.length == 0 && b.firstPageOffset == 0 && b.small == nil && len(b.big) == 0 && b.hasSmall {
-		if total > SmallChunkSize {
-			b.hasSmall = false
-		}
-	}
+	// 一次性保证目标容量够（避免多次 append）
+	b.ensureCapacity(total)
 
 	for srcOff < total {
 		physicalLen := b.length + b.firstPageOffset
@@ -437,6 +432,110 @@ func (b *Buffer) Bytes() []byte {
 		off += len(s)
 	}
 	return res
+}
+
+// ensureCapacity 确保至少还能写 n 字节（自动扩容多页）
+func (b *Buffer) ensureCapacity(n int) {
+	// If this is the very first write and it's already larger than the small page,
+	// start with a big page and skip allocating the small page.
+	if b.length == 0 && b.firstPageOffset == 0 && b.small == nil && len(b.big) == 0 && b.hasSmall {
+		if n > SmallChunkSize {
+			b.hasSmall = false
+		}
+	}
+
+	physicalLen := b.length + b.firstPageOffset
+	need := physicalLen + n
+
+	totalCap := 0
+	if b.hasSmall {
+		if b.small == nil {
+			b.small = getSmallChunk()
+		}
+		totalCap += SmallChunkSize
+		if totalCap > need {
+			return
+		}
+	}
+
+	totalCap += len(b.big) * ChunkSize
+
+	// 增加足够的新页
+	for need > totalCap {
+		b.big = append(b.big, getBigChunk())
+		totalCap += ChunkSize
+	}
+}
+
+// Reserve 预留 n 字节，返回当前页中的可写 slice。
+// 若当前页剩余空间不足，会自动扩页。
+func (b *Buffer) Reserve(n int) []byte {
+	b.ensureCapacity(n)
+
+	physLen := b.length + b.firstPageOffset
+	prefix := 0
+	if b.hasSmall {
+		prefix = SmallChunkSize
+	}
+
+	if b.hasSmall && physLen < SmallChunkSize {
+		// 当前写在 small page
+		if b.small == nil {
+			b.small = getSmallChunk()
+		}
+		innerOff := physLen
+		remain := SmallChunkSize - innerOff
+
+		// 若当前页空间足够，直接返回剩余切片，否则只返回可写区域
+		if remain < n {
+			// 返回当前页剩余部分（让上层分多次调用 Reserve）
+			return b.small[innerOff:SmallChunkSize]
+		}
+		return b.small[innerOff : innerOff+n]
+	}
+
+	// 写在 big page
+	bigPos := physLen - prefix
+	pageIdx := bigPos >> bigShift
+	innerOff := bigPos & bigMask
+	if innerOff == ChunkSize {
+		pageIdx++
+		innerOff = 0
+	}
+	currPage := b.big[pageIdx]
+
+	remain := ChunkSize - innerOff
+
+	if remain < n {
+		// 只返回当前页可写部分，下次 Reserve 再进下一页
+		return currPage[innerOff:ChunkSize]
+	}
+	return currPage[innerOff : innerOff+n]
+}
+
+// Advance 前进写指针 n 字节（告诉 Buffer 实际写入了多少）
+func (b *Buffer) Advance(n int) {
+	b.length += n
+}
+
+// ReadFrom 实现 io.ReaderFrom，可用于零拷贝网络读入
+func (b *Buffer) ReadFrom(r io.Reader) (int64, error) {
+	var total int64
+	for {
+		// 每次预留一页空间
+		dest := b.Reserve(ChunkSize)
+		nr, err := r.Read(dest)
+		if nr > 0 {
+			b.Advance(nr)
+			total += int64(nr)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return total, nil // graceful EOF
+			}
+			return total, err
+		}
+	}
 }
 
 // BufferView 是对 IndexedBuffer 部分片段的只读视图。
