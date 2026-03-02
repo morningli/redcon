@@ -202,7 +202,6 @@ func dataSlices(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset,
 	return result
 }
 
-//go:inline
 func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalStart, length int) BufferView {
 	if hasSmall {
 		if physicalStart < SmallChunkSize {
@@ -299,9 +298,7 @@ func (b *Buffer) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// Slice 模拟 Go 原生切片操作 b[n:m]
-// n: 起始位移 (inclusive)
-// m: 结束位移 (exclusive)
+//go:inline Slice 模拟 Go 原生切片操作 b[n:m],n: 起始位移 (inclusive),m: 结束位移 (exclusive)
 func (b *Buffer) Slice(n, m int) BufferView {
 	if n < 0 || m < n || m > b.length {
 		panic(fmt.Errorf("index out of range [%d:%d] with length %d", n, m, b.length))
@@ -312,7 +309,7 @@ func (b *Buffer) Slice(n, m int) BufferView {
 	return sliceFromPhysical(b.hasSmall, b.small, b.big, physicalStart, length)
 }
 
-// Tail 返回从 n 到末尾的视图，等价于 Go 切片 b[n:].
+//go:inline Tail 返回从 n 到末尾的视图，等价于 Go 切片 b[n:].
 func (b *Buffer) Tail(n int) BufferView {
 	return b.Slice(n, b.Len())
 }
@@ -466,8 +463,7 @@ func (b *Buffer) Free() {
 	b.firstPageOffset = 0
 }
 
-// Data 返回当前 Buffer 逻辑范围内所有物理块的切片引用。
-// 这是一个零拷贝操作，返回的 []byte 直接指向内存池中的物理内存。
+//go:inline Data 返回当前 Buffer 逻辑范围内所有物理块的切片引用。这是一个零拷贝操作，返回的 []byte 直接指向内存池中的物理内存。
 func (b *Buffer) Data() [][]byte {
 	return dataSlices(b.hasSmall, b.small, b.big, b.firstPageOffset, b.length)
 }
@@ -477,7 +473,7 @@ func (b *Buffer) Len() int {
 	return b.length
 }
 
-// At 返回逻辑偏移 index 处的单个字节
+//go:inline At 返回逻辑偏移 index 处的单个字节
 func (b *Buffer) At(index int) byte {
 	if index < 0 || index >= b.length {
 		panic(errors.New("index out of range"))
@@ -503,8 +499,7 @@ func (b *Buffer) Swap(other *Buffer) {
 	b.firstPageOffset, other.firstPageOffset = other.firstPageOffset, b.firstPageOffset
 }
 
-// Bytes 将视图内容合并为一个连续的切片（涉及内存拷贝）
-// 建议仅在必须对接只接收 []byte 的第三方 API 时使用
+//go:inline Bytes 将视图内容合并为一个连续的切片（涉及内存拷贝）建议仅在必须对接只接收 []byte 的第三方 API 时使用
 func (b *Buffer) Bytes() []byte {
 	return dataSlice(b.hasSmall, b.small, b.big, b.firstPageOffset, b.length)
 }
@@ -635,7 +630,7 @@ func (v BufferView) IsEmpty() bool {
 	return v.length == 0
 }
 
-// At 支持随机访问，返回逻辑索引 index 处的字节
+//go:inline At 支持随机访问，返回逻辑索引 index 处的字节
 func (v BufferView) At(index int) byte {
 	if index < 0 || index >= v.length {
 		panic("view index out of range")
@@ -643,19 +638,17 @@ func (v BufferView) At(index int) byte {
 	return atByte(v.hasSmall, v.small, v.big, v.firstPageOffset, index)
 }
 
-// Data 将视图转换为不连续的字节切片列表
-// 常用于 net.Buffers 或 writev 系统调用
+//go:inline Data 将视图转换为不连续的字节切片列表。常用于 net.Buffers 或 writev 系统调用
 func (v BufferView) Data() [][]byte {
 	return dataSlices(v.hasSmall, v.small, v.big, v.firstPageOffset, v.length)
 }
 
-// Bytes 将视图内容转换为连续的切片。
-// 优化：针对单页场景返回底层引用（0 拷贝），仅在跨页时执行分配与合并。
+//go:inline Bytes 将视图内容转换为连续的切片。优化：针对单页场景返回底层引用（0 拷贝），仅在跨页时执行分配与合并。
 func (v BufferView) Bytes() []byte {
 	return dataSlice(v.hasSmall, v.small, v.big, v.firstPageOffset, v.length)
 }
 
-// Slice 在当前视图基础上再次切片 v[n:m]
+//go:inline Slice 在当前视图基础上再次切片 v[n:m]
 func (v BufferView) Slice(n, m int) BufferView {
 	if n < 0 || m < n || m > v.length {
 		panic(fmt.Errorf("view index out of range [%d:%d] with length %d", n, m, v.length))
@@ -666,7 +659,7 @@ func (v BufferView) Slice(n, m int) BufferView {
 	return sliceFromPhysical(v.hasSmall, v.small, v.big, physicalStart, length)
 }
 
-// Tail 返回从 n 到末尾的视图，等价于 Go 切片 v[n:].
+//go:inline Tail 返回从 n 到末尾的视图，等价于 Go 切片 v[n:].
 func (v BufferView) Tail(n int) BufferView {
 	return v.Slice(n, v.Len())
 }
