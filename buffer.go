@@ -313,72 +313,69 @@ func (b *Buffer) Tail(n int) BufferView {
 // 返回的新 Buffer 将承接 [n, length) 字节（剩余流，通过位移实现零平移）。
 func (b *Buffer) Split(n int) *Buffer {
 	if n <= 0 {
-		// 情况：n=0，原 b 变为空，所有数据移交给新返回的 Buffer
 		newBuf := &Buffer{
-			small:           b.small,
+			small:           b.small, // 物理拷贝到新 Buffer
 			big:             b.big,
 			length:          b.length,
 			firstPageOffset: b.firstPageOffset,
 			hasSmall:        b.hasSmall,
 		}
+		// 原 Buffer 只清空引用和计数，不触摸 small 数组
 		b.big, b.length, b.firstPageOffset, b.hasSmall = nil, 0, 0, true
 		return newBuf
 	}
+
 	if n >= b.length {
-		// 情况：n 超过长度，b 保留所有，返回一个空的 Buffer
 		return NewBuffer()
 	}
 
-	originalSmall := b.small
-	originalBig := b.big
-	originalLen := b.length
-	originalFPO := b.firstPageOffset
-	originalHasSmall := b.hasSmall
+	// 记录原始状态，仅提取必要的 big 引用和标志位
+	// 不再提取 originalSmall 副本，直接操作 b.small
+	origBig := b.big
+	origLen := b.length
+	origFPO := b.firstPageOffset
+	origHasSmall := b.hasSmall
 
-	splitPos := n + originalFPO
+	splitPos := n + origFPO
 	newBuf := NewBuffer()
-	newLen := originalLen - n
+	newLen := origLen - n
 
-	// prefix is the size of the first page in bytes (small page when present).
 	prefix := 0
-	if originalHasSmall {
+	if origHasSmall {
 		prefix = SmallChunkSize
 	}
 
-	if originalHasSmall {
-		// Split in small page
+	if origHasSmall {
+		// --- 情况 1：拆分点在 Small 区域 ---
 		if splitPos < SmallChunkSize {
-			// b keeps the original small page (no copy); newBuf gets a fresh small page for suffix.
-			b.small = originalSmall
+			// b 保持现状：数据就在自己的 small 数组里，只需切断 big 引用
 			b.big = nil
-			b.hasSmall = true
 			b.length = n
-			// b.firstPageOffset unchanged
+			// b.hasSmall 恒为 true, b.firstPageOffset 不变，无需重新赋值
 
-			// newBuf: allocate a new small page and copy the suffix bytes into the END part.
+			// newBuf: 物理拷贝后缀到自己的 small 空间
 			suffixLen := min(SmallChunkSize-splitPos, newLen)
-			suffix := originalSmall[splitPos : splitPos+suffixLen]
+			suffix := b.small[splitPos : splitPos+suffixLen]
+
+			// 直接传入 newBuf.small 的地址，减少中间层拷贝
 			newHasSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix, &newBuf.small)
 			newBuf.hasSmall = newHasSmall
 			newBuf.firstPageOffset = newFirstOff
 			if len(newBigFirst) > 0 {
-				// Should never happen since suffixLen <= SmallChunkSize, but keep consistent.
-				newBuf.big = append(newBigFirst, originalBig...)
+				newBuf.big = append(newBigFirst, origBig...)
 			} else {
-				newBuf.big = originalBig
+				newBuf.big = origBig
 			}
 			newBuf.length = newLen
 			return newBuf
 		}
 
-		// Boundary right after small page
+		// --- 情况 2：拆分点恰好在 Small 边界 ---
 		if splitPos == SmallChunkSize {
-			b.small = originalSmall
 			b.big = nil
-			b.hasSmall = true
 			b.length = n
 
-			newBuf.big = originalBig
+			newBuf.big = origBig
 			newBuf.hasSmall = false
 			newBuf.firstPageOffset = 0
 			newBuf.length = newLen
@@ -386,42 +383,40 @@ func (b *Buffer) Split(n int) *Buffer {
 		}
 	}
 
-	// Split in big pages (shared for hasSmall=true and hasSmall=false).
+	// --- 情况 3：在大页区域拆分 ---
 	bigSplitPos := splitPos - prefix
 	splitBigIdx := bigSplitPos >> bigShift
 	innerOff := bigSplitPos & bigMask
 
-	// b keeps pages up to the boundary page; remainder never reuses the boundary page.
-	b.small = originalSmall
-	b.hasSmall = originalHasSmall
+	// b 更新：只需处理 big 切片的引用关系
 	if innerOff > 0 {
-		b.big = append([]*Chunk(nil), originalBig[:splitBigIdx+1]...)
+		b.big = append([]*Chunk(nil), origBig[:splitBigIdx+1]...)
 	} else {
-		b.big = append([]*Chunk(nil), originalBig[:splitBigIdx]...)
+		b.big = append([]*Chunk(nil), origBig[:splitBigIdx]...)
 	}
 	b.length = n
-	// b.firstPageOffset unchanged
 
 	if innerOff == 0 {
-		// Boundary on big page edge: remainder can take pages without copying.
 		newBuf.hasSmall = false
-		newBuf.big = originalBig[splitBigIdx:]
+		newBuf.big = origBig[splitBigIdx:]
 		newBuf.firstPageOffset = 0
 		newBuf.length = newLen
 		return newBuf
 	}
 
-	// Split within a big page: copy suffix to a fresh first page for newBuf.
+	// --- 情况 4：在大页中间拆分，需要“提升”后缀到 newBuf.small ---
 	suffixInThisPage := min(ChunkSize-innerOff, newLen)
-	suffix := originalBig[splitBigIdx][innerOff : innerOff+suffixInThisPage]
+	suffix := origBig[splitBigIdx][innerOff : innerOff+suffixInThisPage]
+
 	newHasSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix, &newBuf.small)
 	newBuf.hasSmall = newHasSmall
 	newBuf.firstPageOffset = newFirstOff
-	if splitBigIdx+1 < len(originalBig) {
+
+	if splitBigIdx+1 < len(origBig) {
 		if len(newBigFirst) > 0 {
-			newBuf.big = append(newBigFirst, originalBig[splitBigIdx+1:]...)
+			newBuf.big = append(newBigFirst, origBig[splitBigIdx+1:]...)
 		} else {
-			newBuf.big = originalBig[splitBigIdx+1:]
+			newBuf.big = origBig[splitBigIdx+1:]
 		}
 	} else {
 		newBuf.big = newBigFirst
