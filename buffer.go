@@ -611,9 +611,88 @@ func (b *Buffer) ReadFull(rd *bufio.Reader, n int) error {
 	return nil
 }
 
+// ReadFrom 尽可能多地从 bufio 缓冲区读取数据
+// 即使数据跨越了多个物理 Chunk (4KB)，也能通过循环一次性读完
+func (b *Buffer) ReadFrom(rd *bufio.Reader) (int64, error) {
+	// 1. 获取当前 bufio 缓冲区中已有的字节数（无系统调用开销）
+	n := rd.Buffered()
+	if n <= 0 {
+		// 如果缓冲区为空，这里可以选择直接返回 0，或者尝试一次阻塞 Read
+		// 建议直接返回，让外层调度器决定何时进行下一次 Syscall
+		return 0, nil
+	}
+
+	// 2. 预先确保 Buffer 有足够的物理 Chunk 承载这些数据
+	b.ensureCapacity(n)
+
+	var total int64
+	remaining := n
+
+	// 3. 循环填充：因为 Reserve 只能返回单页空间
+	for remaining > 0 {
+		// 获取当前物理页剩余空间 (max 4KB)
+		dest := b.Reserve(remaining)
+		if len(dest) == 0 {
+			break // 理论上不应发生，因为已执行 ensureCapacity
+		}
+
+		// 4. 关键：直接调用 *bufio.Reader.Read (Inline 友好)
+		// 由于数据已在 bufio 缓冲区，这里仅执行 runtime.memmove
+		nr, err := rd.Read(dest)
+		if nr > 0 {
+			b.Advance(nr)
+			total += int64(nr)
+			remaining -= nr
+		}
+
+		if err != nil {
+			// 在读取 Buffered 数据时通常不会有 err，除非底层连接断开
+			return total, err
+		}
+	}
+
+	return total, nil
+}
+
 func (b *Buffer) WriteTo(wr io.Writer) (int64, error) {
-	n, err := wr.Write(b.Bytes())
-	return int64(n), err
+	if b.length <= 0 {
+		return 0, nil
+	}
+
+	var total int64
+	remaining := b.length
+	currOff := b.firstPageOffset
+
+	// 1. 处理 SmallChunk (如果有)
+	if b.hasSmall {
+		actualRead := min(SmallChunkSize-currOff, remaining)
+		n, err := wr.Write(b.small[currOff : currOff+actualRead])
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+		remaining -= actualRead
+		currOff = 0
+	}
+
+	// 2. 优化 BigChunk 循环：固定 4KB 逻辑简化
+	for i := 0; i < len(b.big) && remaining > 0; i++ {
+		// 利用固定 ChunkSize 简化计算
+		canRead := ChunkSize - currOff
+		if canRead > remaining {
+			canRead = remaining
+		}
+
+		n, err := wr.Write(b.big[i][currOff : currOff+canRead])
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+
+		remaining -= canRead
+		currOff = 0
+	}
+	return total, nil
 }
 
 // BufferView 是对 IndexedBuffer 部分片段的只读视图。

@@ -226,14 +226,10 @@ func (rd *Reader) readCommands(leftover *int) ([]*Request, error) {
 	if rd.rd == nil {
 		return nil, errIncompleteCommand
 	}
-	b_ := GetBuffer()
-	n, err := rd.rd.Read(b_[:])
+	_, err := rd.buf.ReadFrom(rd.rd)
 	if err != nil {
-		PutBuffer(b_)
 		return nil, err
 	}
-	_, _ = rd.buf.Write(b_[:n])
-	PutBuffer(b_)
 	return rd.readCommands(leftover)
 }
 
