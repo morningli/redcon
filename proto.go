@@ -71,7 +71,7 @@ func Parse(raw []byte) (*Request, error) {
 	if len(leftover) > 0 {
 		return nil, errTooMuchData
 	}
-	cmd := &Request{Raw: NewBuffer()}
+	cmd := NewRequest()
 	wr := NewRespond()
 	wr.WriteArray(len(args))
 	for i := range args {

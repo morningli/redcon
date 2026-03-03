@@ -370,7 +370,7 @@ func testParseBulk(br *bufio.Reader) ([]byte, error) {
 
 func TestFastParseInt_Simple(t *testing.T) {
 	// 模拟一個 BufferView (单页 Fast-Path 覆盖)
-	small := &SmallChunk{}
+	small := SmallChunk{}
 	copy(small[10:], "-12345")
 	v := BufferView{hasSmall: true, small: small, firstPageOffset: 10, length: 6}
 

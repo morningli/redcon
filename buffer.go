@@ -59,12 +59,10 @@ type Buffer struct {
 	hasSmall        bool
 	firstPageOffset int // 第一页的起始有效数据偏移（0 ~ pageSize-1）
 	// small 仅用于第一页（256B）。当 Buffer 的起始页为大页时 small==nil。
-	small *SmallChunk
+	small SmallChunk
 	// big 保存后续所有 4KB 页；当 Buffer 起始页为大页时，big[0] 即第一页。
-	big []*Chunk
-
+	big    []*Chunk
 	length int // 逻辑上的总有效数据长度
-
 }
 
 // NewBuffer 创建一个空 Buffer。
@@ -83,7 +81,7 @@ func min(a, b int) int {
 	return b
 }
 
-func atByte(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset int, index int) byte {
+func atByte(hasSmall bool, small SmallChunk, big []*Chunk, firstPageOffset int, index int) byte {
 	physicalOff := index + firstPageOffset
 	if hasSmall {
 		if physicalOff < SmallChunkSize {
@@ -96,7 +94,7 @@ func atByte(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset int,
 	return big[pageIdx][innerOff]
 }
 
-func dataSlice(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset, length int) []byte {
+func dataSlice(hasSmall bool, small SmallChunk, big []*Chunk, firstPageOffset, length int) []byte {
 	if length <= 0 {
 		return nil
 	}
@@ -147,7 +145,7 @@ func dataSlice(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset, 
 	return res
 }
 
-func dataSlices(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset, length int) [][]byte {
+func dataSlices(hasSmall bool, small SmallChunk, big []*Chunk, firstPageOffset, length int) [][]byte {
 	if length <= 0 {
 		return nil
 	}
@@ -204,7 +202,7 @@ func dataSlices(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset,
 	return result
 }
 
-func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalStart, length int) BufferView {
+func sliceFromPhysical(hasSmall bool, small SmallChunk, big []*Chunk, physicalStart, length int) BufferView {
 	if hasSmall {
 		if physicalStart < SmallChunkSize {
 			return BufferView{
@@ -220,7 +218,6 @@ func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalS
 		newFirstOff := off2 & bigMask
 		return BufferView{
 			hasSmall:        false,
-			small:           nil,
 			big:             big[startBigIdx:], // 仅拷贝切片头(24字节)，不重分配底层数组
 			length:          length,
 			firstPageOffset: newFirstOff,
@@ -231,7 +228,6 @@ func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalS
 	newFirstOff := physicalStart & bigMask
 	return BufferView{
 		hasSmall:        false,
-		small:           nil,
 		big:             big[startBigIdx:],
 		length:          length,
 		firstPageOffset: newFirstOff,
@@ -240,17 +236,16 @@ func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalS
 
 // makeSuffixFirstPage allocates a new first page and copies suffix bytes into the END part of that page.
 // It never reuses the boundary page from the old buffer.
-func makeSuffixFirstPage(suffix []byte) (hasSmall bool, small *SmallChunk, big []*Chunk, firstOff int) {
+func makeSuffixFirstPage(suffix []byte, ns *SmallChunk) (hasSmall bool, big []*Chunk, firstOff int) {
 	if len(suffix) <= SmallChunkSize {
-		ns := getSmallChunk()
 		firstOff = SmallChunkSize - len(suffix)
 		copy(ns[firstOff:], suffix)
-		return true, ns, nil, firstOff
+		return true, nil, firstOff
 	}
 	nb := getBigChunk()
 	firstOff = ChunkSize - len(suffix)
 	copy(nb[firstOff:], suffix)
-	return false, nil, []*Chunk{nb}, firstOff
+	return false, []*Chunk{nb}, firstOff
 }
 
 func (b *Buffer) Write(p []byte) (int, error) {
@@ -269,9 +264,6 @@ func (b *Buffer) Write(p []byte) (int, error) {
 
 		// First page is small when hasSmall==true. Try to write into the small page first.
 		if b.hasSmall && physicalLen < SmallChunkSize {
-			if b.small == nil {
-				b.small = getSmallChunk()
-			}
 			innerOff := physicalLen
 			canWrite := SmallChunkSize - innerOff
 			copyLen := min(canWrite, total-srcOff)
@@ -329,7 +321,7 @@ func (b *Buffer) Split(n int) *Buffer {
 			firstPageOffset: b.firstPageOffset,
 			hasSmall:        b.hasSmall,
 		}
-		b.small, b.big, b.length, b.firstPageOffset, b.hasSmall = nil, nil, 0, 0, true
+		b.big, b.length, b.firstPageOffset, b.hasSmall = nil, 0, 0, true
 		return newBuf
 	}
 	if n >= b.length {
@@ -356,11 +348,6 @@ func (b *Buffer) Split(n int) *Buffer {
 	if originalHasSmall {
 		// Split in small page
 		if splitPos < SmallChunkSize {
-			if originalSmall == nil {
-				// Shouldn't happen: data exists but small nil. Be defensive.
-				originalSmall = getSmallChunk()
-				b.small = originalSmall
-			}
 			// b keeps the original small page (no copy); newBuf gets a fresh small page for suffix.
 			b.small = originalSmall
 			b.big = nil
@@ -371,9 +358,8 @@ func (b *Buffer) Split(n int) *Buffer {
 			// newBuf: allocate a new small page and copy the suffix bytes into the END part.
 			suffixLen := min(SmallChunkSize-splitPos, newLen)
 			suffix := originalSmall[splitPos : splitPos+suffixLen]
-			newHasSmall, newSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix)
+			newHasSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix, &newBuf.small)
 			newBuf.hasSmall = newHasSmall
-			newBuf.small = newSmall
 			newBuf.firstPageOffset = newFirstOff
 			if len(newBigFirst) > 0 {
 				// Should never happen since suffixLen <= SmallChunkSize, but keep consistent.
@@ -392,7 +378,6 @@ func (b *Buffer) Split(n int) *Buffer {
 			b.hasSmall = true
 			b.length = n
 
-			newBuf.small = nil
 			newBuf.big = originalBig
 			newBuf.hasSmall = false
 			newBuf.firstPageOffset = 0
@@ -419,7 +404,6 @@ func (b *Buffer) Split(n int) *Buffer {
 
 	if innerOff == 0 {
 		// Boundary on big page edge: remainder can take pages without copying.
-		newBuf.small = nil
 		newBuf.hasSmall = false
 		newBuf.big = originalBig[splitBigIdx:]
 		newBuf.firstPageOffset = 0
@@ -430,9 +414,8 @@ func (b *Buffer) Split(n int) *Buffer {
 	// Split within a big page: copy suffix to a fresh first page for newBuf.
 	suffixInThisPage := min(ChunkSize-innerOff, newLen)
 	suffix := originalBig[splitBigIdx][innerOff : innerOff+suffixInThisPage]
-	newHasSmall, newSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix)
+	newHasSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix, &newBuf.small)
 	newBuf.hasSmall = newHasSmall
-	newBuf.small = newSmall
 	newBuf.firstPageOffset = newFirstOff
 	if splitBigIdx+1 < len(originalBig) {
 		if len(newBigFirst) > 0 {
@@ -449,14 +432,7 @@ func (b *Buffer) Split(n int) *Buffer {
 
 // Free 释放内存
 func (b *Buffer) Free() {
-	// 注意：在 Split 场景下，多个 Buffer 可能引用同一个 Chunk
-	// 这里简单的 Put 回池子仅适用于你确定该 Buffer 独占这些 Chunk 的情况
-	// 如果需要严谨，需要引入引用计数。但在 gnet 解析完即销毁的场景，
-	// 通常在处理完最后一个 Split 块后统一释放即可。
-	if b.hasSmall && b.small != nil {
-		putSmallChunk(b.small)
-	}
-	b.small = nil
+	b.hasSmall = true
 	for i := range b.big {
 		putBigChunk(b.big[i])
 	}
@@ -510,7 +486,7 @@ func (b *Buffer) Bytes() []byte {
 func (b *Buffer) ensureCapacity(n int) {
 	// If this is the very first write and it's already larger than the small page,
 	// start with a big page and skip allocating the small page.
-	if b.length == 0 && b.firstPageOffset == 0 && b.small == nil && len(b.big) == 0 && b.hasSmall {
+	if b.length == 0 && b.firstPageOffset == 0 && len(b.big) == 0 && b.hasSmall {
 		if n > SmallChunkSize {
 			b.hasSmall = false
 		}
@@ -521,9 +497,6 @@ func (b *Buffer) ensureCapacity(n int) {
 
 	totalCap := 0
 	if b.hasSmall {
-		if b.small == nil {
-			b.small = getSmallChunk()
-		}
 		totalCap += SmallChunkSize
 		if totalCap > need {
 			return
@@ -547,10 +520,6 @@ func (b *Buffer) reserve() []byte {
 	}
 
 	if b.hasSmall && physLen < SmallChunkSize {
-		// 当前写在 small page
-		if b.small == nil {
-			b.small = getSmallChunk()
-		}
 		innerOff := physLen
 		return b.small[innerOff:]
 	}
@@ -621,9 +590,6 @@ func (b *Buffer) ReadFrom(rd *bufio.Reader) (int64, error) {
 	var dest []byte
 	// 判定当前写在 SmallChunk 还是 BigChunk
 	if b.hasSmall && physLen < SmallChunkSize {
-		if b.small == nil {
-			b.ensureCapacity(1)
-		} // 兜底初始化
 		dest = b.small[physLen:SmallChunkSize]
 	} else {
 		bigPos := physLen - prefix
@@ -699,7 +665,7 @@ func (b *Buffer) WriteTo(wr io.Writer) (int64, error) {
 // BufferView 是对 IndexedBuffer 部分片段的只读视图。
 // 它通过引用原 Buffer 的页表并记录逻辑偏移来实现零拷贝操作。
 type BufferView struct {
-	small    *SmallChunk
+	small    SmallChunk
 	big      []*Chunk
 	hasSmall bool
 	// length 是该视图的逻辑总长度
