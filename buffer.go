@@ -62,15 +62,17 @@ type Buffer struct {
 	small *SmallChunk
 	// big 保存后续所有 4KB 页；当 Buffer 起始页为大页时，big[0] 即第一页。
 	big []*Chunk
-
-	length int // 逻辑上的总有效数据长度
-
+	// length 逻辑上的总有效数据长度
+	length int
+	// capacity 缓存当前 Buffer 总物理容量（包含 small 和所有 big）
+	capacity int
 }
 
 // NewBuffer 创建一个空 Buffer。
 func NewBuffer() *Buffer {
 	return &Buffer{
 		hasSmall: true,
+		capacity: 0, // 初始容量为 256
 		big:      make([]*Chunk, 0, initBigPageCount),
 	}
 }
@@ -328,10 +330,12 @@ func (b *Buffer) Split(n int) *Buffer {
 			length:          b.length,
 			firstPageOffset: b.firstPageOffset,
 			hasSmall:        b.hasSmall,
+			capacity:        b.capacity, // 继承总容量
 		}
-		b.small, b.big, b.length, b.firstPageOffset, b.hasSmall = nil, nil, 0, 0, true
+		b.small, b.big, b.length, b.firstPageOffset, b.hasSmall, b.capacity = nil, nil, 0, 0, true, 0
 		return newBuf
 	}
+
 	if n >= b.length {
 		// 情况：n 超过长度，b 保留所有，返回一个空的 Buffer
 		return NewBuffer()
@@ -367,6 +371,7 @@ func (b *Buffer) Split(n int) *Buffer {
 			b.hasSmall = true
 			b.length = n
 			// b.firstPageOffset unchanged
+			b.capacity = SmallChunkSize // b 仅剩 small
 
 			// newBuf: allocate a new small page and copy the suffix bytes into the END part.
 			suffixLen := min(SmallChunkSize-splitPos, newLen)
@@ -375,6 +380,8 @@ func (b *Buffer) Split(n int) *Buffer {
 			newBuf.hasSmall = newHasSmall
 			newBuf.small = newSmall
 			newBuf.firstPageOffset = newFirstOff
+
+			// 继承后续大页
 			if len(newBigFirst) > 0 {
 				// Should never happen since suffixLen <= SmallChunkSize, but keep consistent.
 				newBuf.big = append(newBigFirst, originalBig...)
@@ -382,6 +389,8 @@ func (b *Buffer) Split(n int) *Buffer {
 				newBuf.big = originalBig
 			}
 			newBuf.length = newLen
+			// 更新 newBuf.capacity: 计算方式同 ensureCapacity
+			newBuf.capacity = calculateCapacity(newBuf.hasSmall, len(newBuf.big))
 			return newBuf
 		}
 
@@ -391,12 +400,14 @@ func (b *Buffer) Split(n int) *Buffer {
 			b.big = nil
 			b.hasSmall = true
 			b.length = n
+			b.capacity = SmallChunkSize
 
 			newBuf.small = nil
 			newBuf.big = originalBig
 			newBuf.hasSmall = false
 			newBuf.firstPageOffset = 0
 			newBuf.length = newLen
+			newBuf.capacity = calculateCapacity(false, len(newBuf.big))
 			return newBuf
 		}
 	}
@@ -411,8 +422,10 @@ func (b *Buffer) Split(n int) *Buffer {
 	b.hasSmall = originalHasSmall
 	if innerOff > 0 {
 		b.big = append([]*Chunk(nil), originalBig[:splitBigIdx+1]...)
+		b.capacity = prefix + (splitBigIdx+1)*ChunkSize
 	} else {
 		b.big = append([]*Chunk(nil), originalBig[:splitBigIdx]...)
+		b.capacity = prefix + (splitBigIdx)*ChunkSize
 	}
 	b.length = n
 	// b.firstPageOffset unchanged
@@ -424,6 +437,7 @@ func (b *Buffer) Split(n int) *Buffer {
 		newBuf.big = originalBig[splitBigIdx:]
 		newBuf.firstPageOffset = 0
 		newBuf.length = newLen
+		newBuf.capacity = len(newBuf.big) * ChunkSize
 		return newBuf
 	}
 
@@ -444,7 +458,17 @@ func (b *Buffer) Split(n int) *Buffer {
 		newBuf.big = newBigFirst
 	}
 	newBuf.length = newLen
+	newBuf.capacity = calculateCapacity(newBuf.hasSmall, len(newBuf.big))
 	return newBuf
+}
+
+// 辅助函数，避免重复逻辑。建议内联。
+func calculateCapacity(hasSmall bool, bigCount int) int {
+	cap := bigCount * ChunkSize
+	if hasSmall {
+		cap += SmallChunkSize
+	}
+	return cap
 }
 
 // Free 释放内存
@@ -463,6 +487,7 @@ func (b *Buffer) Free() {
 	b.big = nil
 	b.length = 0
 	b.firstPageOffset = 0
+	b.capacity = 0
 }
 
 //go:inline Data 返回当前 Buffer 逻辑范围内所有物理块的切片引用。这是一个零拷贝操作，返回的 []byte 直接指向内存池中的物理内存。
@@ -490,15 +515,20 @@ func (b *Buffer) Swap(other *Buffer) {
 		return
 	}
 
+	// 1. 物理交换小页数组 (触发 256 字节拷贝)
 	b.small, other.small = other.small, b.small
+
+	// 2. 交换大页切片引用 (仅交换指针和长度/容量信息)
 	b.big, other.big = other.big, b.big
+
+	// 3. 交换状态位与长度
 	b.hasSmall, other.hasSmall = other.hasSmall, b.hasSmall
-
-	// 交换逻辑长度
 	b.length, other.length = other.length, b.length
-
-	// 交换起始偏移量
 	b.firstPageOffset, other.firstPageOffset = other.firstPageOffset, b.firstPageOffset
+
+	// 4. 【核心优化】交换预计算的物理容量
+	// 确保 Swap 后，ensureCapacity 的内联检查依然准确
+	b.capacity, other.capacity = other.capacity, b.capacity
 }
 
 //go:inline Bytes 将视图内容合并为一个连续的切片（涉及内存拷贝）建议仅在必须对接只接收 []byte 的第三方 API 时使用
@@ -508,34 +538,43 @@ func (b *Buffer) Bytes() []byte {
 
 // ensureCapacity 确保至少还能写 n 字节（自动扩容多页）
 func (b *Buffer) ensureCapacity(n int) {
+	needed := b.length + b.firstPageOffset + n
+
+	// 极速路径：空间足够，直接返回
+	if b.capacity >= needed {
+		return
+	}
+
+	// 慢速路径：需要扩容
+	b.grow(needed)
+}
+
+func (b *Buffer) grow(needed int) {
 	// If this is the very first write and it's already larger than the small page,
 	// start with a big page and skip allocating the small page.
 	if b.length == 0 && b.firstPageOffset == 0 && b.small == nil && len(b.big) == 0 && b.hasSmall {
-		if n > SmallChunkSize {
+		if needed > SmallChunkSize {
 			b.hasSmall = false
 		}
 	}
 
 	physicalLen := b.length + b.firstPageOffset
-	need := physicalLen + n
+	need := physicalLen + needed
 
-	totalCap := 0
 	if b.hasSmall {
 		if b.small == nil {
 			b.small = getSmallChunk()
 		}
-		totalCap += SmallChunkSize
-		if totalCap > need {
+		b.capacity += SmallChunkSize
+		if b.capacity > need {
 			return
 		}
 	}
 
-	totalCap += len(b.big) * ChunkSize
-
 	// 增加足够的新页
-	for need > totalCap {
+	for need > b.capacity {
 		b.big = append(b.big, getBigChunk())
-		totalCap += ChunkSize
+		b.capacity += ChunkSize
 	}
 }
 
@@ -754,6 +793,8 @@ func (v BufferView) Tail(n int) BufferView {
 
 func (b *Buffer) Reset() {
 	b.length = 0
+	b.hasSmall = true
+	b.capacity = calculateCapacity(b.hasSmall, len(b.big))
 	// 不要清空 b.big，让已申请的 Chunk 留在切片里供下一轮 Reserve 直接使用
 	// 这样 Reserve(len) 内部就会直接返回 b.big[0][0:len]，实现真正的 0 分配
 }
