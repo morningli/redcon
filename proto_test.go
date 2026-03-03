@@ -463,3 +463,14 @@ func TestReadUntilCRLF_Boundary(t *testing.T) {
 		t.Errorf("Buffer 长度错误: %d", r.Buffer.Len())
 	}
 }
+
+func TestRespond_ReadFrom(t *testing.T) {
+	buf := NewRespond()
+
+	input := []byte("*1\r\n$4\r\nkeys\r\n")
+	rd := bufio.NewReaderSize(bytes.NewReader(input), 1024)
+	n, err := buf.ReadFrom(rd)
+	require.NoError(t, err)
+	require.Equal(t, input, buf.Bytes())
+	require.Equal(t, int64(len(input)), int64(n))
+}

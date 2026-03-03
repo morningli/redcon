@@ -3,6 +3,7 @@ package redcon
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"testing"
 
@@ -517,6 +518,99 @@ func TestBuffer_ReadFull_MultiPage(t *testing.T) {
 			if allData[len(prefix)+i] != testData[i] {
 				t.Errorf("第一个错误发生在偏移量 %d (逻辑位置 %d), 期望 %d, 实际 %d",
 					i, len(prefix)+i, testData[i], allData[len(prefix)+i])
+				break
+			}
+		}
+	}
+}
+
+func TestBuffer_WriteTo(t *testing.T) {
+	buf := NewBuffer()
+
+	// 1. 强制检查写入过程
+	input := []byte("hello world")
+	_, err := buf.Write(input)
+	require.NoError(t, err)
+
+	// 2. 检查内部状态（调试打印）
+	fmt.Printf("Buffer State: hasSmall=%v, len=%d, offset=%d\n", buf.hasSmall, buf.length, buf.firstPageOffset)
+
+	// 3. 使用标准方式读取结果
+	wr := new(bytes.Buffer)
+	n, err := buf.WriteTo(wr)
+
+	require.NoError(t, err)
+	require.Equal(t, int64(len(input)), n)
+
+	// 4. 重点：检查 wr.Bytes() 而不是原始切片
+	require.Equal(t, input, wr.Bytes(), "数据内容不匹配，检查 Write 或 WriteTo 的拷贝逻辑")
+}
+
+func TestBuffer_ReadFrom2(t *testing.T) {
+	buf := NewBuffer()
+
+	input := []byte("hello world")
+	rd := bufio.NewReaderSize(bytes.NewReader(input), 1024)
+	n, err := buf.ReadFrom(rd)
+	require.NoError(t, err)
+	require.Equal(t, input, buf.Bytes())
+	require.Equal(t, int64(len(input)), int64(n))
+}
+
+func TestBuffer_WriteTo_Complex(t *testing.T) {
+	// 1. 初始化 Buffer，构造跨越 SmallChunk 和多个 BigChunk 的数据
+	buf := NewBuffer() // 假设初始 hasSmall 为 true
+
+	// 写入一些数据制造偏移。例如先写 10 字节。
+	// 这会使得 firstPageOffset = 0, length = 10 (在 SmallChunk 中)
+	initialData := []byte("0123456789")
+	buf.Write(initialData)
+
+	// 此时模拟从中间开始写，人为调整 firstPageOffset (模拟之前的 Read 操作留下的偏移)
+	// 比如我们只关心从第 5 个字节开始的数据
+	const offset = 5
+	buf.firstPageOffset = offset
+	buf.length -= offset
+	// 此时有效数据是 "56789"，长度 5
+
+	// 2. 灌入大量数据跨越多个 BigChunk (4KB * 2 + 500 字节)
+	extraSize := ChunkSize*2 + 500
+	extraData := make([]byte, extraSize)
+	for i := 0; i < extraSize; i++ {
+		extraData[i] = byte('A' + (i % 26))
+	}
+	buf.Write(extraData)
+
+	// 计算预期总数据
+	expectedData := append([]byte("56789"), extraData...)
+	expectedTotal := int64(len(expectedData))
+
+	// 3. 执行 WriteTo
+	// 使用 bytes.Buffer 接收输出，模拟生产环境中的 bufio.Writer
+	output := new(bytes.Buffer)
+	n, err := buf.WriteTo(output)
+
+	// 4. 验证
+	if err != nil {
+		t.Fatalf("WriteTo 失败: %v", err)
+	}
+
+	if n != expectedTotal {
+		t.Errorf("返回的写入长度不符: 期望 %d, 实际 %d", expectedTotal, n)
+	}
+
+	if int64(output.Len()) != expectedTotal {
+		t.Errorf("Writer 接收到的数据长度不符: 期望 %d, 实际 %d", expectedTotal, output.Len())
+	}
+
+	if !bytes.Equal(output.Bytes(), expectedData) {
+		t.Error("写入的数据内容不一致！可能在 Chunk 切换或 currOff 重置时发生了错误")
+
+		// 辅助调试：定位第一个坏字节
+		res := output.Bytes()
+		for i := 0; i < len(expectedData); i++ {
+			if res[i] != expectedData[i] {
+				t.Errorf("第一个错误发生在索引 %d, 期望 %x, 实际 %x", i, expectedData[i], res[i])
 				break
 			}
 		}

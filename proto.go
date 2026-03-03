@@ -111,7 +111,8 @@ func (r *Respond) ReadFrom(rd *bufio.Reader) (int64, error) {
 	if r.Buffer.Len() > 0 {
 		return 0, errors.New("ReadFrom: buffer must be empty")
 	}
-	return int64(r.Buffer.Len()), r.decodeStream(rd)
+	err := r.decodeStream(rd)
+	return int64(r.Buffer.Len()), err
 }
 
 // parseInt parses an integer reply.
