@@ -1,6 +1,9 @@
 package redcon
 
 import (
+	"bufio"
+	"bytes"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -366,6 +369,158 @@ func TestBufferView_Bytes_Precision(t *testing.T) {
 			t.Errorf("Big FastPath 错误")
 		}
 	})
+}
+
+func TestBuffer_ReadFrom(t *testing.T) {
+	// 1. 准备测试数据：构造一个大于单页 (4KB) 的数据量，例如 10KB
+	// 这将跨越至少 3 个物理 Chunk
+	const dataSize = 10 * 1024
+	testData := make([]byte, dataSize)
+	for i := 0; i < dataSize; i++ {
+		testData[i] = byte(i % 256)
+	}
+
+	// 2. 初始化 bufio.Reader
+	// 注意：bufio 默认缓冲区通常是 4KB，我们手动设为 16KB 以确保一次能 Buffered 更多数据
+	rawReader := bytes.NewReader(testData)
+	rd := bufio.NewWriterSize(nil, 16*1024) // 仅占位
+	_ = rd                                  // 实际上我们需要的是下面这个
+	brd := bufio.NewReaderSize(rawReader, 16*1024)
+
+	// 预填充 bufio 的缓冲区（执行一次 Peek 或 Read 触发底层填充）
+	_, _ = brd.Peek(dataSize)
+	if brd.Buffered() != dataSize {
+		t.Fatalf("bufio 缓冲区未填充完毕: 期望 %d, 实际 %d", dataSize, brd.Buffered())
+	}
+
+	// 3. 初始化你的内存池 Buffer
+	// 假设 NewBuffer 是你的构造函数
+	buf := NewBuffer()
+
+	// 4. 执行测试逻辑
+	n, err := buf.ReadFrom(brd)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadFromBuffered 执行失败: %v", err)
+	}
+
+	// 5. 验证结果
+	if n != int64(dataSize) {
+		t.Errorf("读取长度不符: 期望 %d, 实际 %d", dataSize, n)
+	}
+
+	if buf.Len() != dataSize {
+		t.Errorf("Buffer 长度不符: 期望 %d, 实际 %d", dataSize, buf.Len())
+	}
+
+	// 验证数据完整性 (使用你之前的 Bytes() 或遍历逻辑)
+	if !bytes.Equal(buf.Bytes(), testData) {
+		t.Error("读取到的数据内容不一致（可能在 Chunk 切换时发生了覆盖或偏移错误）")
+	}
+
+	// 验证 bufio 缓冲区是否已清空
+	if brd.Buffered() != 0 {
+		t.Errorf("bufio 缓冲区未完全消耗: 剩余 %d", brd.Buffered())
+	}
+}
+
+// 可选：增加一个边界测试，验证当 Buffer 已有部分数据且 offset 不在页首时的情况
+func TestBuffer_ReadFrom_WithOffset(t *testing.T) {
+	buf := NewBuffer()
+	buf.Write([]byte("hello world")) // 11
+
+	extraData := bytes.Repeat([]byte("a"), 5000)
+
+	// 【关键修复】设置缓冲区为 10KB，确保 5000 字节能被 Buffered()
+	brd := bufio.NewReaderSize(bytes.NewReader(extraData), 10240)
+
+	// 预读触发填充
+	_, _ = brd.Peek(5000)
+
+	t.Logf("Before: Buffered = %d", brd.Buffered()) // 这里应该打印 5000
+
+	n, err := buf.ReadFrom(brd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("After: n = %d, buf.Len = %d", n, buf.Len())
+
+	if buf.Len() != 5011 {
+		t.Errorf("期望 5011, 实际 %d", buf.Len())
+	}
+}
+
+func TestBuffer_ReadFrom_WithOffset2(t *testing.T) {
+	buf := NewBuffer()
+	buf.Write([]byte("hello world")) // 11
+
+	extraData := bytes.Repeat([]byte("a"), 5000)
+
+	// 【关键修复】设置缓冲区为 10KB，确保 5000 字节能被 Buffered()
+	brd := bufio.NewReaderSize(bytes.NewReader(extraData), 10240)
+
+	t.Logf("Before: Buffered = %d", brd.Buffered()) // 这里应该打印 5000
+
+	n, err := buf.ReadFrom(brd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("After: n = %d, buf.Len = %d", n, buf.Len())
+
+	if buf.Len() != SmallChunkSize {
+		t.Errorf("期望 5011, 实际 %d", buf.Len())
+	}
+}
+
+func TestBuffer_ReadFull_MultiPage(t *testing.T) {
+	// 1. 构造 10KB 数据 (10240 字节)，将跨越：
+	// SmallChunk(if exists) + BigChunk0 + BigChunk1 + BigChunk2
+	const dataSize = 10 * 1024
+	testData := make([]byte, dataSize)
+	for i := 0; i < dataSize; i++ {
+		testData[i] = byte(i % 256)
+	}
+
+	// 2. 初始化 Buffer 并制造一个起始偏移量 (例如 11 字节)
+	// 这样可以测试物理页不是从 0 开始填充的情况
+	buf := NewBuffer()
+	prefix := []byte("head_offset") // 11 字节
+	buf.Write(prefix)
+
+	// 3. 构造 bufio.Reader
+	brd := bufio.NewReaderSize(bytes.NewReader(testData), 16*1024)
+
+	// 4. 执行 ReadFull
+	err := buf.ReadFull(brd, dataSize)
+	if err != nil {
+		t.Fatalf("ReadFull 失败: %v", err)
+	}
+
+	// 5. 验证长度
+	expectedTotal := len(prefix) + dataSize // 11 + 10240 = 10251
+	if buf.Len() != expectedTotal {
+		t.Errorf("总长度不符: 期望 %d, 实际 %d", expectedTotal, buf.Len())
+	}
+
+	// 6. 验证数据完整性 (最关键的一步)
+	// 检查每一个字节是否正确，特别是跨越 4096 字节边界的地方
+	allData := buf.Bytes()
+	if !bytes.Equal(allData[:len(prefix)], prefix) {
+		t.Error("头部前缀数据损坏")
+	}
+	if !bytes.Equal(allData[len(prefix):], testData) {
+		t.Error("ReadFull 灌入的数据内容不一致，可能在跨页切换时发生了索引计算错误")
+
+		// 找出第一个出错的字节位置
+		for i := 0; i < dataSize; i++ {
+			if allData[len(prefix)+i] != testData[i] {
+				t.Errorf("第一个错误发生在偏移量 %d (逻辑位置 %d), 期望 %d, 实际 %d",
+					i, len(prefix)+i, testData[i], allData[len(prefix)+i])
+				break
+			}
+		}
+	}
 }
 
 var payload = [100]byte{}

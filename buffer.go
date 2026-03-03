@@ -569,10 +569,6 @@ func (b *Buffer) Reserve(n int) []byte {
 	bigPos := physLen - prefix
 	pageIdx := bigPos >> bigShift
 	innerOff := bigPos & bigMask
-	if innerOff == ChunkSize {
-		pageIdx++
-		innerOff = 0
-	}
 	currPage := b.big[pageIdx]
 
 	remain := ChunkSize - innerOff
@@ -614,44 +610,55 @@ func (b *Buffer) ReadFull(rd *bufio.Reader, n int) error {
 // ReadFrom 尽可能多地从 bufio 缓冲区读取数据
 // 即使数据跨越了多个物理 Chunk (4KB)，也能通过循环一次性读完
 func (b *Buffer) ReadFrom(rd *bufio.Reader) (int64, error) {
-	// 1. 获取当前 bufio 缓冲区中已有的字节数（无系统调用开销）
+	// 1. 优先处理 Pipeline 积压（高性能路径）
 	n := rd.Buffered()
-	if n <= 0 {
-		// 如果缓冲区为空，这里可以选择直接返回 0，或者尝试一次阻塞 Read
-		// 建议直接返回，让外层调度器决定何时进行下一次 Syscall
-		return 0, nil
+	if n > 0 {
+		err := b.ReadFull(rd, n)
+		return int64(n), err
 	}
 
-	// 2. 预先确保 Buffer 有足够的物理 Chunk 承载这些数据
-	b.ensureCapacity(n)
-
-	var total int64
-	remaining := n
-
-	// 3. 循环填充：因为 Reserve 只能返回单页空间
-	for remaining > 0 {
-		// 获取当前物理页剩余空间 (max 4KB)
-		dest := b.Reserve(remaining)
-		if len(dest) == 0 {
-			break // 理论上不应发生，因为已执行 ensureCapacity
-		}
-
-		// 4. 关键：直接调用 *bufio.Reader.Read (Inline 友好)
-		// 由于数据已在 bufio 缓冲区，这里仅执行 runtime.memmove
-		nr, err := rd.Read(dest)
-		if nr > 0 {
-			b.Advance(nr)
-			total += int64(nr)
-			remaining -= nr
-		}
-
-		if err != nil {
-			// 在读取 Buffered 数据时通常不会有 err，除非底层连接断开
-			return total, err
-		}
+	// 2. 缓冲区为空，执行“对齐填充当前页”策略
+	physLen := b.length + b.firstPageOffset
+	prefix := 0
+	if b.hasSmall {
+		prefix = SmallChunkSize
 	}
 
-	return total, nil
+	var dest []byte
+	// 判定当前写在 SmallChunk 还是 BigChunk
+	if b.hasSmall && physLen < SmallChunkSize {
+		if b.small == nil {
+			b.ensureCapacity(1)
+		} // 兜底初始化
+		dest = b.small[physLen:SmallChunkSize]
+	} else {
+		bigPos := physLen - prefix
+		pageIdx := bigPos >> bigShift
+		innerOff := bigPos & bigMask
+
+		// 关键优化：检查当前页是否已满
+		if innerOff == 0 && (len(b.big) <= pageIdx) {
+			// 当前页正好用完，或者还没分配，触发申请一个新 BigChunk
+			b.ensureCapacity(1)
+		} else if innerOff == 0 && pageIdx < len(b.big) {
+			// 已经在页首，无需申请
+		} else if innerOff > 0 && innerOff >= ChunkSize {
+			// 极端边界：手动进位并申请
+			b.ensureCapacity(1)
+			pageIdx = (b.length + b.firstPageOffset - prefix) >> bigShift
+			innerOff = 0
+		}
+
+		// 获取当前页剩余的连续空间
+		dest = b.big[pageIdx][innerOff:ChunkSize]
+	}
+
+	// 3. 发起单次对齐 Read
+	nr, err := rd.Read(dest)
+	if nr > 0 {
+		b.Advance(nr)
+	}
+	return int64(nr), err
 }
 
 func (b *Buffer) WriteTo(wr io.Writer) (int64, error) {
