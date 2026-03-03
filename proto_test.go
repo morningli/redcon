@@ -474,3 +474,46 @@ func TestRespond_ReadFrom(t *testing.T) {
 	require.Equal(t, input, buf.Bytes())
 	require.Equal(t, int64(len(input)), int64(n))
 }
+
+func BenchmarkRespond_ReadUntilCRLF(b *testing.B) {
+	shortLine := []byte("PING\r\n")
+	longLine := append(bytes.Repeat([]byte("a"), 5120), []byte("\r\n")...)
+
+	// 注意：我们将 runBenchmarkReadUntil 的逻辑直接内联或重构，以支持对象复用
+	b.Run("Short-Line-12B", func(b *testing.B) {
+		runBenchmarkReadUntil(b, shortLine)
+	})
+
+	b.Run("Long-Line-5KB", func(b *testing.B) {
+		runBenchmarkReadUntil(b, longLine)
+	})
+}
+
+func runBenchmarkReadUntil(b *testing.B, data []byte) {
+	// 1. 【关键】将对象初始化移出循环，模拟真实的 3w 连接池化场景
+	r := &Respond{
+		Buffer: NewBuffer(),
+	}
+	// 预分配一个足够大的 Reader 供复用
+	rd := bufio.NewReaderSize(nil, 16384)
+	// 预准备数据源，避免在循环内分配 bytes.Reader
+	readerSource := bytes.NewReader(data)
+
+	b.ReportAllocs()
+	b.ResetTimer() // 2. 【关键】重置计时器，只测量 readUntilCRLF 逻辑
+
+	for i := 0; i < b.N; i++ {
+		// 3. 【关键】复用 Buffer
+		// 确保你的 Buffer.Reset() 只是将 length 设为 0，而不释放已有的 BigChunks
+		r.Buffer.Reset()
+
+		// 4. 重置数据源和 Reader 指针
+		readerSource.Reset(data)
+		rd.Reset(readerSource)
+
+		_, err := r.readUntilCRLF(rd)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

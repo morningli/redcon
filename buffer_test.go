@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -636,4 +637,55 @@ func BenchmarkBuffer_SliceWrite(b *testing.B) {
 			buf = append(buf, payload[:]...)
 		}
 	}
+}
+
+func BenchmarkCompare_WriteMethods(b *testing.B) {
+	size := 32768 // 32KB, 跨 8 个 BigChunk (4KB)
+	data := make([]byte, size)
+	for i := 0; i < size; i++ {
+		data[i] = byte(i % 256)
+	}
+
+	buf := NewBuffer()
+	buf.Write(data)
+	dw := io.Discard
+
+	// 方案 1: 重构后的 WriteTo + bufio
+	b.Run("Stream-WriteTo-Bufio", func(b *testing.B) {
+		bw := bufio.NewWriterSize(dw, 32<<10) // 足够大的缓冲区
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			buf.WriteTo(bw)
+			bw.Flush()
+		}
+	})
+
+	// 方案 2: 标准库 net.Buffers
+	b.Run("Net-Buffers-Writev", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			// 构造 net.Buffers (注意：这里会产生 [][]byte 的分配)
+			var netBuf net.Buffers
+			if buf.hasSmall {
+				netBuf = append(netBuf, buf.small[:buf.length]) // 简化逻辑
+			} else {
+				for _, chunk := range buf.big {
+					netBuf = append(netBuf, chunk[:])
+				}
+			}
+			netBuf.WriteTo(dw)
+		}
+	})
+
+	// 方案 3: 原生 Bytes() 全量拷贝 (Baseline)
+	b.Run("Native-Bytes-Copy", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			temp := buf.Bytes()
+			dw.Write(temp)
+		}
+	})
 }

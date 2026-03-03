@@ -215,42 +215,42 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 
 func (r *Respond) readUntilCRLF(rd *bufio.Reader) (BufferView, error) {
 	start := r.Buffer.Len()
-	found := false
 
-	for !found {
-		// 1. 直接寻找下一个 '\n'
+	for {
+		// 1. bufio 告诉我们要写多少
 		line, err := rd.ReadSlice('\n')
-		if err != nil {
-			if err == bufio.ErrBufferFull {
-				// 缓冲器满了还沒找到 \n，必须先存入 Buffer 并继续
-				r.Buffer.Write(line)
-				continue
-			}
+		if err != nil && err != bufio.ErrBufferFull {
 			return BufferView{}, err
 		}
-		_, _ = r.Buffer.Write(line)
 
-		// 2. 拿到 line，最后一个字节保证是 '\n'
-		n := len(line)
-		if n >= 2 && line[n-2] == '\r' {
-			// 情況 A：\r\n 都在这一次 ReadSlice 的结果中 (最常见)
-			found = true
-		} else if n == 1 {
-			// 情況 B：这一次只拿到 '\n'，需要看 r.Buffer 刚才存入的最后一個字节
-			// 只有当前 Buffer 已有数据时才检查
-			currLen := r.Buffer.Len()
-			if currLen > 0 && r.Buffer.At(currLen-2) == '\r' {
-				found = true
-			} else {
-				// 普通 \n，继续
+		// 2. 直接根据 line 长度去要空间
+		// 即使 line 跨页了，我们之前的循环 Copy 逻辑也能处理
+		remLine := line
+		for len(remLine) > 0 {
+			// 精准申请：我要这么多，Buffer 会根据物理情况给我“当前页能给的最大量”
+			dest := r.Buffer.Reserve(len(remLine))
+
+			n := copy(dest, remLine)
+			r.Buffer.Advance(n) // 仅增加逻辑长度
+
+			remLine = remLine[n:]
+			// 只有在处理超长行（跨 4KB）时，才会进第二次循环重新 Reserve
+		}
+
+		// 3. 协议匹配逻辑
+		if err == nil {
+			nLine := len(line)
+			if nLine >= 2 && line[nLine-2] == '\r' {
+				return r.Buffer.Tail(start), nil
+			} else if nLine == 1 {
+				// 针对 \r 在前一页末尾，\n 在本页开头的极端情况
+				currLen := r.Buffer.Len()
+				if currLen >= 2 && r.Buffer.At(currLen-2) == '\r' {
+					return r.Buffer.Tail(start), nil
+				}
 			}
-		} else {
-			// 情況 C：拿到了一段以 \n 结尾但前面不是 \r 的数据
 		}
 	}
-
-	// 返回这一行的视图
-	return r.Buffer.Tail(start), nil
 }
 
 // WriteNull writes a null to the client

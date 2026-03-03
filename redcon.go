@@ -261,7 +261,7 @@ func serve(s *Server) error {
 		c := &conn{
 			conn: lnconn,
 			addr: lnconn.RemoteAddr().String(),
-			wr:   bufio.NewWriter(lnconn),
+			wr:   bufio.NewWriterSize(lnconn, 32<<10),
 			rd:   NewReader(lnconn),
 		}
 		s.mu.Lock()

@@ -15,7 +15,7 @@ type Reader struct {
 // NewReader returns a command reader which will read RESP or telnet commands.
 func NewReader(rd io.Reader) *Reader {
 	return &Reader{
-		rd:  bufio.NewReader(rd),
+		rd:  bufio.NewReaderSize(rd, 32<<10),
 		buf: NewBuffer(),
 	}
 }

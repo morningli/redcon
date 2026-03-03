@@ -75,6 +75,7 @@ func NewBuffer() *Buffer {
 	}
 }
 
+//go:inline
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -758,22 +759,8 @@ func (v BufferView) Tail(n int) BufferView {
 	return v.Slice(n, v.Len())
 }
 
-// GetBuffer 从池中获取一个干净的 Buffer 实例
-func GetBuffer() *Chunk {
-	return chunkPool.Get().(*Chunk)
-}
-
-// PutBuffer 释放 Buffer 持有的物理内存并将其归还至对象池
-func PutBuffer(b *Chunk) {
-	chunkPool.Put(b)
-}
-
-// GetSmallBuffer 从池中获取一个 256B 小页。
-func GetSmallBuffer() *SmallChunk {
-	return smallChunkPool.Get().(*SmallChunk)
-}
-
-// PutSmallBuffer 将小页归还至对象池。
-func PutSmallBuffer(b *SmallChunk) {
-	smallChunkPool.Put(b)
+func (b *Buffer) Reset() {
+	b.length = 0
+	// 不要清空 b.big，让已申请的 Chunk 留在切片里供下一轮 Reserve 直接使用
+	// 这样 Reserve(len) 内部就会直接返回 b.big[0][0:len]，实现真正的 0 分配
 }
