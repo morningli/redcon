@@ -277,6 +277,7 @@ func serve(s *Server) error {
 				res := NewRespond()
 				res.WriteError(err.Error())
 				_, err = res.WriteTo(c.wr)
+				_ = c.wr.Flush()
 				res.Free()
 				_ = c.Close()
 				continue
@@ -331,6 +332,7 @@ func handle(s *Server, c *conn) {
 					res := NewRespond()
 					res.WriteError("ERR " + err.Error())
 					_, _ = res.WriteTo(c.wr)
+					_ = c.wr.Flush()
 					res.Free()
 				}
 				return err
@@ -355,6 +357,12 @@ func handle(s *Server, c *conn) {
 				s.handler(c, cmd, res)
 				cmd.ProcessDoneTime = time.Now()
 				_, err = res.WriteTo(c.wr)
+				if err != nil {
+					cmd.Free()
+					res.Free()
+					return err
+				}
+				err = c.wr.Flush()
 				if err != nil {
 					cmd.Free()
 					res.Free()
