@@ -115,6 +115,30 @@ func (r *Respond) ReadFrom(rd *bufio.Reader) (int64, error) {
 	return int64(r.Buffer.Len()), err
 }
 
+// parseLen parses bulk string and array lengths.
+func fastParseLen(p BufferView) (int, error) {
+	if p.Len() == 0 {
+		return 0, errors.New("redis: ERR malformed integer")
+	}
+	raw := p.Bytes()
+
+	if raw[0] == '-' && len(raw) == 2 && raw[1] == '1' {
+		// handle $-1 and $-1 null replies.
+		return -1, nil
+	}
+
+	var n int
+	for _, b := range raw {
+		n *= 10
+		if b < '0' || b > '9' {
+			return -1, errors.New("redis: ERR illegal bytes in length")
+		}
+		n += int(b - '0')
+	}
+
+	return n, nil
+}
+
 // parseInt parses an integer reply.
 func fastParseInt(p BufferView) (int, error) {
 	if p.Len() == 0 {
@@ -163,13 +187,7 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 		return nil
 	case Bulk:
 		// 1. 读取长度行视图
-		lenLineView, err := r.readUntilCRLF(rd)
-		if err != nil {
-			return err
-		}
-
-		// 解析长度 (利用 BufferView 的 Bytes() 临时转 string 转换，或直接解析 ASCII)
-		n, err := fastParseInt(lenLineView.Slice(0, lenLineView.Len()-2))
+		n, err := r.readRespLen(rd)
 		if err != nil {
 			return err
 		}
@@ -186,11 +204,7 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 		return nil
 	case Array:
 		// 1. 读取数量行视图
-		countLineView, err := r.readUntilCRLF(rd)
-		if err != nil {
-			return err
-		}
-		count, err := fastParseInt(countLineView.Slice(0, countLineView.Len()-2))
+		count, err := r.readRespLen(rd)
 		if err != nil {
 			return err
 		}
@@ -215,40 +229,100 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 
 func (r *Respond) readUntilCRLF(rd *bufio.Reader) (BufferView, error) {
 	start := r.Buffer.Len()
+	var lastChar byte // 缓存上一个写入的字节，用于跨循环检查 \r\n
 
 	for {
-		// 1. bufio 告诉我们要写多少
+		// 1. 利用 bufio 的 ReadSlice 寻找行尾 \n
 		line, err := rd.ReadSlice('\n')
 		if err != nil && err != bufio.ErrBufferFull {
 			return BufferView{}, err
 		}
 
-		// 2. 直接根据 line 长度去要空间
-		// 即使 line 跨页了，我们之前的循环 Copy 逻辑也能处理
-		remLine := line
-		for len(remLine) > 0 {
-			// 精准申请：我要这么多，Buffer 会根据物理情况给我“当前页能给的最大量”
-			dest := r.Buffer.Reserve(len(remLine))
+		nLine := len(line)
+		if nLine > 0 {
+			// 【核心优化】更新 lastChar。
+			// 如果 nLine >= 2，lastChar 更新为 \n 前的那一位。
+			// 如果 nLine == 1，lastChar 保持为上一轮循环写入 Buffer 的最后一个字节。
+			if nLine >= 2 {
+				lastChar = line[nLine-2]
+			}
 
-			n := copy(dest, remLine)
-			r.Buffer.Advance(n) // 仅增加逻辑长度
-
-			remLine = remLine[n:]
-			// 只有在处理超长行（跨 4KB）时，才会进第二次循环重新 Reserve
+			// 2. 精准物理写入逻辑 (保持原有高效 Copy)
+			remLine := line
+			for len(remLine) > 0 {
+				dest := r.Buffer.Reserve(len(remLine))
+				n := copy(dest, remLine)
+				r.Buffer.Advance(n)
+				remLine = remLine[n:]
+			}
 		}
 
-		// 3. 协议匹配逻辑
+		// 3. RESP 协议匹配逻辑
 		if err == nil {
-			nLine := len(line)
-			if nLine >= 2 && line[nLine-2] == '\r' {
+			// 此时最后一位必定是 \n。
+			// 无论 \r 是在当前 line 中，还是在上一轮循环的末尾，
+			// 此时的 lastChar 寄存器里存的一定是 \n 前面的那一位。
+			if lastChar == '\r' {
 				return r.Buffer.Tail(start), nil
-			} else if nLine == 1 {
-				// 针对 \r 在前一页末尾，\n 在本页开头的极端情况
-				currLen := r.Buffer.Len()
-				if currLen >= 2 && r.Buffer.At(currLen-2) == '\r' {
-					return r.Buffer.Tail(start), nil
-				}
 			}
+
+			// 如果不是 \r\n，将 lastChar 更新为 \n，继续寻找
+			lastChar = '\n'
+		}
+	}
+}
+
+// readRespLen 在将原始数据存入 Buffer 的同时，实时解析其代表的长度值
+func (r *Respond) readRespLen(rd *bufio.Reader) (int, error) {
+	var (
+		n          int
+		isNegative bool
+		digitCount int
+		lastChar   byte
+	)
+
+	for {
+		line, err := rd.ReadSlice('\n')
+		nLine := len(line)
+
+		if nLine > 0 {
+			// 1. 物理写入 Buffer
+			remLine := line
+			for len(remLine) > 0 {
+				dest := r.Buffer.Reserve(len(remLine))
+				c := copy(dest, remLine)
+				r.Buffer.Advance(c)
+				remLine = remLine[c:]
+			}
+
+			// 2. 实时解析 (利用本地变量 line 避免多次访问 Buffer)
+			for i := 0; i < nLine; i++ {
+				b := line[i]
+				if b >= '0' && b <= '9' {
+					n = n*10 + int(b-'0')
+					digitCount++
+				} else if b == '-' && digitCount == 0 {
+					isNegative = true
+					digitCount++
+				} else if b == '\n' && lastChar == '\r' {
+					// 匹配成功
+					if isNegative {
+						if n == 1 && digitCount == 2 {
+							return -1, nil
+						}
+						return 0, errors.New("redis: ERR invalid length")
+					}
+					return n, nil
+				}
+				lastChar = b
+			}
+		}
+
+		if err != nil {
+			if err == bufio.ErrBufferFull {
+				continue
+			}
+			return 0, err
 		}
 	}
 }

@@ -539,11 +539,7 @@ func (b *Buffer) ensureCapacity(n int) {
 	}
 }
 
-// Reserve 预留 n 字节，返回当前页中的可写 slice。
-// 若当前页剩余空间不足，会自动扩页。
-func (b *Buffer) Reserve(n int) []byte {
-	b.ensureCapacity(n)
-
+func (b *Buffer) reserve() []byte {
 	physLen := b.length + b.firstPageOffset
 	prefix := 0
 	if b.hasSmall {
@@ -556,14 +552,7 @@ func (b *Buffer) Reserve(n int) []byte {
 			b.small = getSmallChunk()
 		}
 		innerOff := physLen
-		remain := SmallChunkSize - innerOff
-
-		// 若当前页空间足够，直接返回剩余切片，否则只返回可写区域
-		if remain < n {
-			// 返回当前页剩余部分（让上层分多次调用 Reserve）
-			return b.small[innerOff:SmallChunkSize]
-		}
-		return b.small[innerOff : innerOff+n]
+		return b.small[innerOff:]
 	}
 
 	// 写在 big page
@@ -571,14 +560,18 @@ func (b *Buffer) Reserve(n int) []byte {
 	pageIdx := bigPos >> bigShift
 	innerOff := bigPos & bigMask
 	currPage := b.big[pageIdx]
+	return currPage[innerOff:]
+}
 
-	remain := ChunkSize - innerOff
-
-	if remain < n {
-		// 只返回当前页可写部分，下次 Reserve 再进下一页
-		return currPage[innerOff:ChunkSize]
+// Reserve 预留 n 字节，返回当前页中的可写 slice。
+// 若当前页剩余空间不足，会自动扩页。
+func (b *Buffer) Reserve(n int) []byte {
+	b.ensureCapacity(n)
+	left := b.reserve()
+	if len(left) > n {
+		left = left[:n]
 	}
-	return currPage[innerOff : innerOff+n]
+	return left
 }
 
 // Advance 前进写指针 n 字节（告诉 Buffer 实际写入了多少）

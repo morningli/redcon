@@ -517,3 +517,41 @@ func runBenchmarkReadUntil(b *testing.B, data []byte) {
 		}
 	}
 }
+
+func BenchmarkRespond_DecodeStream(b *testing.B) {
+	// 準備不同類型的 Redis 協議數據
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		// 修正后的测试数据
+		{"Ping", []byte("+PONG\r\n")},                                         // 必须带 '+'
+		{"Bulk-1K", []byte("$1024\r\n" + strings.Repeat("a", 1024) + "\r\n")}, // 结尾必须有 \r\n
+		{"Array-MGet", []byte("*3\r\n$3\r\nGET\r\n$4\r\nkey1\r\n$4\r\nkey2\r\n")},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			// 1. 初始化環境，確保對象複用 (0 Alloc)
+			r := &Respond{Buffer: NewBuffer()}
+			rd := bufio.NewReaderSize(nil, 16384)
+			src := bytes.NewReader(tc.data)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// 2. 重置狀態，不重新分配物理 Chunk
+				r.Buffer.Reset()
+				src.Reset(tc.data)
+				rd.Reset(src)
+
+				// 3. 執行重構後的 FillStreaming 解析
+				err := r.decodeStream(rd)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
