@@ -274,8 +274,7 @@ func serve(s *Server) error {
 				s.mu.Unlock()
 				res := NewRespond()
 				res.WriteError(err.Error())
-				chunks := net.Buffers(res.Data())
-				_, err = chunks.WriteTo(c.conn)
+				_, err = res.WriteTo(c.conn)
 				res.Free()
 				_ = c.Close()
 				continue
@@ -329,8 +328,7 @@ func handle(s *Server, c *conn) {
 					// the client. Ignore write errors.
 					res := NewRespond()
 					res.WriteError("ERR " + err.Error())
-					chunks := net.Buffers(res.Data())
-					_, _ = chunks.WriteTo(c.conn)
+					_, _ = res.WriteTo(c.conn)
 					res.Free()
 				}
 				return err
@@ -354,8 +352,7 @@ func handle(s *Server, c *conn) {
 				res := NewRespond()
 				s.handler(c, cmd, res)
 				cmd.ProcessDoneTime = time.Now()
-				chunks := net.Buffers(res.Data())
-				_, err = chunks.WriteTo(c.conn)
+				_, err = res.WriteTo(c.conn)
 				if err != nil {
 					cmd.Free()
 					res.Free()

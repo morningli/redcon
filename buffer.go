@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -608,6 +609,11 @@ func (b *Buffer) ReadFull(rd *bufio.Reader, n int) error {
 		}
 	}
 	return nil
+}
+
+func (b *Buffer) WriteTo(wr io.Writer) (int64, error) {
+	n, err := wr.Write(b.Bytes())
+	return int64(n), err
 }
 
 // BufferView 是对 IndexedBuffer 部分片段的只读视图。

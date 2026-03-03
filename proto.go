@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"time"
 )
 
@@ -57,8 +56,7 @@ func (r *Request) WriteTo(wr io.Writer) (int64, error) {
 	if r.Raw.Len() == 0 {
 		return 0, io.EOF
 	}
-	chunks := net.Buffers(r.Raw.Data())
-	return chunks.WriteTo(wr)
+	return r.Raw.WriteTo(wr)
 }
 
 // Parse parses a raw RESP message and returns a command.
