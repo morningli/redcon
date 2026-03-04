@@ -54,18 +54,18 @@ func putSmallChunk(c *SmallChunk) {
 
 // Buffer 是基于固定大小页的可增长字节缓冲区，支持零拷贝 Slice。
 type Buffer struct {
-	// hasSmall 表示该 Buffer 的起始页是否为 small（256B）。
-	// NewBuffer 创建的 Buffer 恒为 true；Split 得到的 remainder 可能为 false（零拷贝所需）。
-	hasSmall        bool
-	firstPageOffset int // 第一页的起始有效数据偏移（0 ~ pageSize-1）
-	// small 仅用于第一页（256B）。当 Buffer 的起始页为大页时 small==nil。
-	small *SmallChunk
-	// big 保存后续所有 4KB 页；当 Buffer 起始页为大页时，big[0] 即第一页。
-	big []*Chunk
 	// length 逻辑上的总有效数据长度
 	length int
+	// firstPageOffset 第一页的起始有效数据偏移（0 ~ pageSize-1）
+	firstPageOffset int
 	// capacity 缓存当前 Buffer 总物理容量（包含 small 和所有 big）
 	capacity int
+	// hasSmall 表示该 Buffer 的起始页是否为 small（256B）。NewBuffer 创建的 Buffer 恒为 true；Split 得到的 remainder 可能为 false（零拷贝所需）。
+	hasSmall bool
+	// big 保存后续所有 4KB 页；当 Buffer 起始页为大页时，big[0] 即第一页。
+	big []*Chunk
+	// small 仅用于第一页（256B）
+	small *SmallChunk
 }
 
 // NewBuffer 创建一个空 Buffer。
