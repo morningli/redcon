@@ -256,48 +256,83 @@ func makeSuffixFirstPage(suffix []byte) (hasSmall bool, small *SmallChunk, big [
 }
 
 func (b *Buffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if n == 0 {
+		return 0, nil
+	}
+
+	// 1. Fast Path: 针对小数据包，直接写入当前 Small 或 Big 页
+	// 减少 ensureCapacity 的调用开销
+	pLen := b.length + b.firstPageOffset
+
+	// 情况 A: 还在 SmallChunk 范围内
+	if b.hasSmall && pLen < SmallChunkSize {
+		canWrite := SmallChunkSize - pLen
+		if n <= canWrite {
+			if b.small == nil {
+				b.small = getSmallChunk()
+			}
+			copy(b.small[pLen:], p)
+			b.length += n
+			return n, nil
+		}
+		// 跨页了，交给 Slow Path
+	} else if !b.hasSmall && len(b.big) > 0 {
+		// 情况 B: 还在当前 BigChunk 最后一页的剩余空间内
+		innerOff := pLen & bigMask
+		canWrite := ChunkSize - innerOff
+		if n <= canWrite {
+			copy(b.big[len(b.big)-1][innerOff:], p)
+			b.length += n
+			return n, nil
+		}
+	}
+
+	// 2. Slow Path: 大数据或跨多页写入
+	return b.writeSlow(p)
+}
+
+// go:noinline
+func (b *Buffer) writeSlow(p []byte) (int, error) {
 	total := len(p)
+	b.ensureCapacity(total) // 一次性扩容
+
 	srcOff := 0
-
-	// 一次性保证目标容量够（避免多次 append）
-	b.ensureCapacity(total)
-
 	for srcOff < total {
-		physicalLen := b.length + b.firstPageOffset
+		pLen := b.length + b.firstPageOffset
+
+		// 优先处理 SmallChunk
+		if b.hasSmall && pLen < SmallChunkSize {
+			if b.small == nil {
+				b.small = getSmallChunk()
+			}
+			copyLen := min(SmallChunkSize-pLen, total-srcOff)
+			copy(b.small[pLen:], p[srcOff:srcOff+copyLen])
+			b.length += copyLen
+			srcOff += copyLen
+			continue
+		}
+
+		// 处理 BigChunk
 		prefix := 0
 		if b.hasSmall {
 			prefix = SmallChunkSize
 		}
 
-		// First page is small when hasSmall==true. Try to write into the small page first.
-		if b.hasSmall && physicalLen < SmallChunkSize {
-			if b.small == nil {
-				b.small = getSmallChunk()
-			}
-			innerOff := physicalLen
-			canWrite := SmallChunkSize - innerOff
-			copyLen := min(canWrite, total-srcOff)
-			copy(b.small[innerOff:], p[srcOff:srcOff+copyLen])
-
-			srcOff += copyLen
-			b.length += copyLen
-			continue
-		}
-
-		// Write into big pages (shared for hasSmall==true/false).
-		bigPos := physicalLen - prefix
+		bigPos := pLen - prefix
 		pageIdx := bigPos >> bigShift
 		innerOff := bigPos & bigMask
+
+		// 批量补充页面（由 ensureCapacity 保证，这里其实仅需索引访问）
 		for pageIdx >= len(b.big) {
 			b.big = append(b.big, getBigChunk())
 		}
-		currPage := b.big[pageIdx]
-		canWrite := ChunkSize - innerOff
-		copyLen := min(canWrite, total-srcOff)
-		copy(currPage[innerOff:], p[srcOff:srcOff+copyLen])
 
-		srcOff += copyLen
+		copyLen := min(ChunkSize-innerOff, total-srcOff)
+		copy(b.big[pageIdx][innerOff:], p[srcOff:srcOff+copyLen])
+
 		b.length += copyLen
+		srcOff += copyLen
 	}
 	return total, nil
 }

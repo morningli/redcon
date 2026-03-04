@@ -229,28 +229,29 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 
 func (r *Respond) readUntilCRLF(rd *bufio.Reader) (BufferView, error) {
 	start := r.Buffer.Len()
-	// Fast Path: 尝试单次读取。如果一行就在 bufio 缓存内且包含 \r\n，直接处理。
 	line, err := rd.ReadSlice('\n')
+
+	// Fast Path: 99% 的情况，一行内直接读到 \r\n
 	if err == nil && len(line) >= 2 && line[len(line)-2] == '\r' {
-		// 物理写入 (内联 Buffer 写入逻辑以消除调用开销)
-		r.writeToBuffer(line)
+		r.Buffer.Write(line) // 利用优化的 b.Write 内联写入
 		return r.Buffer.Tail(start), nil
 	}
-	// Slow Path: 跨缓存块、ErrBufferFull 或非 \r\n 结尾
+
+	// Slow Path: 跨缓存块、非 \r\n 结尾或错误处理
 	return r.readUntilCRLFSlow(rd, start, line, err)
 }
 
 //go:noinline
-func (r *Respond) readUntilCRLFSlow(rd *bufio.Reader, start int, firstLine []byte, firstErr error) (BufferView, error) {
-	line, err := firstLine, firstErr
+func (r *Respond) readUntilCRLFSlow(rd *bufio.Reader, start int, line []byte, err error) (BufferView, error) {
 	var lastChar byte
 	for {
 		if len(line) > 0 {
 			if len(line) >= 2 {
 				lastChar = line[len(line)-2]
 			}
-			r.writeToBuffer(line)
+			r.Buffer.Write(line)
 		}
+
 		if err == nil {
 			if lastChar == '\r' {
 				return r.Buffer.Tail(start), nil
@@ -259,6 +260,7 @@ func (r *Respond) readUntilCRLFSlow(rd *bufio.Reader, start int, firstLine []byt
 		} else if err != bufio.ErrBufferFull {
 			return BufferView{}, err
 		}
+
 		line, err = rd.ReadSlice('\n')
 	}
 }
@@ -266,9 +268,10 @@ func (r *Respond) readUntilCRLFSlow(rd *bufio.Reader, start int, firstLine []byt
 // readRespLen 在将原始数据存入 Buffer 的同时，实时解析其代表的长度值
 func (r *Respond) readRespLen(rd *bufio.Reader) (int, error) {
 	line, err := rd.ReadSlice('\n')
-	// Fast Path: 常见的 RESP 整数（如 :10\r\n 或 $5\r\n），通常在 12 字节内
+
+	// Fast Path: 针对 RESP 常见的短整数（如 :10\r\n, $5\r\n）
 	if err == nil && len(line) >= 3 && line[len(line)-2] == '\r' {
-		// 尝试快速解析数字 (不包含负数处理以保持精简)
+		// 快速判断是否为正整数（不含负号逻辑以保持精简，确保内联）
 		if line[0] >= '0' && line[0] <= '9' {
 			val := 0
 			isNum := true
@@ -282,25 +285,28 @@ func (r *Respond) readRespLen(rd *bufio.Reader) (int, error) {
 				}
 			}
 			if isNum {
-				r.writeToBuffer(line)
+				r.Buffer.Write(line)
 				return val, nil
 			}
 		}
 	}
-	// Slow Path: 负数、长数字、跨块读取
+	// Slow Path: 处理负数 ($-1), 跨块读取, 或极长数字
 	return r.readRespLenSlow(rd, line, err)
 }
 
 //go:noinline
-func (r *Respond) readRespLenSlow(rd *bufio.Reader, firstLine []byte, firstErr error) (int, error) {
-	var n, digitCount int
-	var isNegative bool
-	var lastChar byte
-	line, err := firstLine, firstErr
+func (r *Respond) readRespLenSlow(rd *bufio.Reader, line []byte, err error) (int, error) {
+	var (
+		n, digitCount int
+		isNegative    bool
+		lastChar      byte
+		b             = r.Buffer
+	)
 
 	for {
 		if len(line) > 0 {
-			r.writeToBuffer(line)
+			b.Write(line)
+			// 实时解析算术逻辑
 			for i := 0; i < len(line); i++ {
 				char := line[i]
 				if char >= '0' && char <= '9' {
@@ -321,36 +327,15 @@ func (r *Respond) readRespLenSlow(rd *bufio.Reader, firstLine []byte, firstErr e
 				lastChar = char
 			}
 		}
-		if err != nil && err != bufio.ErrBufferFull {
+
+		if err != nil {
+			if err == bufio.ErrBufferFull {
+				line, err = rd.ReadSlice('\n')
+				continue
+			}
 			return 0, err
 		}
 		line, err = rd.ReadSlice('\n')
-	}
-}
-
-// 建议在 Respond 结构体下增加此辅助方法，编译器会将其内联到上述 Fast Path 中
-func (r *Respond) writeToBuffer(line []byte) {
-	b := r.Buffer
-	// 只有确定是 Small 模式才去算 pLen，对非 Small 模式更友好
-	if b.hasSmall && b.small != nil {
-		pLen := b.length + b.firstPageOffset
-		if pLen+len(line) <= SmallChunkSize {
-			copy(b.small[pLen:], line)
-			b.length += len(line)
-			return
-		}
-	}
-	r.bufferWriteSlow(line)
-}
-
-//go:noinline
-func (r *Respond) bufferWriteSlow(line []byte) {
-	remLine := line
-	for len(remLine) > 0 {
-		dest := r.Buffer.Reserve(len(remLine))
-		n := copy(dest, remLine)
-		r.Buffer.Advance(n)
-		remLine = remLine[n:]
 	}
 }
 
