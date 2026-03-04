@@ -131,9 +131,7 @@ func (rd *Reader) readCommands(leftover *int) ([]*Request, error) {
 						}
 						cmds = append(cmds, cmd)
 					}
-					b_ := b.Split(i + 1)
-					b.Free()
-					b = b_
+					b.Discard(i + 1)
 					if b.Len() > 0 {
 						goto next
 					} else {
@@ -190,15 +188,7 @@ func (rd *Reader) readCommands(leftover *int) ([]*Request, error) {
 					}
 					if len(marks) == count*2 {
 						var cmd = NewRequest()
-						if rd.rd != nil {
-							b_ := b.Split(i + 1)
-							b.Swap(b_)
-							cmd.Raw.Swap(b_)
-						} else {
-							b_ := b.Split(i + 1)
-							b.Swap(b_)
-							cmd.Raw.Swap(b_)
-						}
+						b.ShiftTo(i+1, cmd.Raw)
 						cmd.Args = make([]BufferView, len(marks)/2)
 						// slice up the raw command into the args based on
 						// the recorded marks.

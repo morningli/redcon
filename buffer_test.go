@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -52,7 +53,8 @@ func TestBuffer_UpgradeFromSmallToBig(t *testing.T) {
 
 	// Split 后两段内容必须正确
 	left := buf.Slice(0, SmallChunkSize).Bytes()
-	newBuf := buf.Split(SmallChunkSize)
+	newBuf := NewBuffer()
+	buf.Split(SmallChunkSize, newBuf)
 	right := newBuf.Bytes()
 	require.Equal(t, payload[:SmallChunkSize], left)
 	require.Equal(t, payload[SmallChunkSize:], right)
@@ -75,7 +77,8 @@ func TestBuffer_Split_RemainderSuffixFitsSmall(t *testing.T) {
 	// Split inside the big page so that remainder's first fragment is <=128.
 	// Pick split such that only 5 bytes remain in the big page fragment.
 	splitAt := SmallChunkSize + 5
-	newBuf := buf.Split(splitAt)
+	newBuf := NewBuffer()
+	buf.Split(splitAt, newBuf)
 
 	// newBuf should start with a small page (optimization path)
 	require.True(t, newBuf.hasSmall)
@@ -143,7 +146,8 @@ func TestBuffer_Split_DoesNotShareBoundaryPageAndKeepsOldViews(t *testing.T) {
 
 	// Split inside the first big page.
 	splitAt := SmallChunkSize + 5
-	rem := buf.Split(splitAt)
+	rem := NewBuffer()
+	buf.Split(splitAt, rem)
 
 	// Old buffer keeps boundary big page pointer.
 	require.True(t, buf.hasSmall)
@@ -178,7 +182,8 @@ func TestBuffer_Split_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
 
 	// Split near end of first big page so suffix <= SmallChunkSize.
 	splitAt := ChunkSize - (SmallChunkSize / 2)
-	rem := buf.Split(splitAt)
+	rem := NewBuffer()
+	buf.Split(splitAt, rem)
 	require.True(t, rem.hasSmall)
 	require.NotNil(t, rem.small)
 	require.Equal(t, payload[splitAt:], rem.Bytes())
@@ -202,7 +207,8 @@ func TestBuffer_Split_BigOnly_RemainderSuffixNeedsBig(t *testing.T) {
 	// Split so suffix in this page > SmallChunkSize, which should force newBuf to allocate a big page.
 	suffix := SmallChunkSize + 20
 	splitAt := ChunkSize - suffix
-	rem := buf.Split(splitAt)
+	rem := NewBuffer()
+	buf.Split(splitAt, rem)
 	require.False(t, rem.hasSmall)
 	require.GreaterOrEqual(t, len(rem.big), 1)
 	require.NotSame(t, boundary, rem.big[0])
@@ -688,4 +694,424 @@ func BenchmarkCompare_WriteMethods(b *testing.B) {
 			dw.Write(temp)
 		}
 	})
+}
+
+const (
+	HotCacheSize = 2048 // 针对 3 万并发建议的大小
+)
+
+// --- 方案 A: 原生 sync.Pool ---
+var rawPool = sync.Pool{
+	New: func() interface{} { return new(SmallChunk) },
+}
+
+// --- 方案 B: 优化后的二级池 (Hot Cache + sync.Pool) ---
+var (
+	hotCache  = make(chan *SmallChunk, HotCacheSize)
+	smartPool = sync.Pool{
+		New: func() interface{} { return new(SmallChunk) },
+	}
+)
+
+func BenchmarkPoolContention(b *testing.B) {
+	b.SetParallelism(128) // 模拟极高并发
+
+	b.Run("Raw_sync.Pool", func(b *testing.B) {
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				c := rawPool.Get().(*SmallChunk)
+
+				// 强制内存写入，防止编译器优化
+				c[0] = byte(1)
+				if c[SmallChunkSize-1] != 0 {
+					_ = c[0]
+				}
+
+				rawPool.Put(c)
+			}
+		})
+	})
+
+	b.Run("Optimized_TwoLayerPool", func(b *testing.B) {
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				var c *SmallChunk
+				select {
+				case c = <-hotCache:
+				default:
+					c = smartPool.Get().(*SmallChunk)
+				}
+
+				// 强制内存写入
+				c[0] = byte(1)
+				if c[SmallChunkSize-1] != 0 {
+					_ = c[0]
+				}
+
+				select {
+				case hotCache <- c:
+				default:
+					smartPool.Put(c)
+				}
+			}
+		})
+	})
+}
+
+func TestBuffer_ShiftTo(t *testing.T) {
+	// 初始化 Buffer 并写入跨页数据 (Small + 1.5 Big Chunks)
+	b := NewBuffer()
+	p1 := make([]byte, SmallChunkSize) // 256B
+	p2 := make([]byte, ChunkSize)      // 4096B
+	p3 := make([]byte, 500)            // 500B
+	for i := range p1 {
+		p1[i] = 'a'
+	}
+	for i := range p2 {
+		p2[i] = 'b'
+	}
+	for i := range p3 {
+		p3[i] = 'c'
+	}
+
+	b.Write(p1)
+	b.Write(p2)
+	b.Write(p3) // 总长度: 256 + 4096 + 500 = 4852
+
+	t.Run("ShiftSmall", func(t *testing.T) {
+		target := NewBuffer()
+		b.ShiftTo(100, target) // 从头部切出 100B (还在 Small 区域)
+
+		require.Equal(t, 100, target.Len())
+		require.True(t, target.hasSmall)
+		require.Equal(t, byte('a'), target.Bytes()[0])
+
+		require.Equal(t, 4752, b.Len())
+		require.Equal(t, 100, b.firstPageOffset)
+		require.True(t, b.hasSmall)
+	})
+
+	t.Run("ShiftToBoundary", func(t *testing.T) {
+		target := NewBuffer()
+		// 此时 b 剩余 4752，前 156B 在 Small，后面是大页
+		b.ShiftTo(156, target) // 刚好切完 Small 剩余部分
+
+		require.Equal(t, 156, target.Len())
+		require.Equal(t, byte('a'), target.Bytes()[0])
+
+		require.Equal(t, 4596, b.Len())
+		require.False(t, b.hasSmall) // b 应该不再持有 small
+		require.Equal(t, 0, b.firstPageOffset)
+		require.Equal(t, byte('b'), b.Bytes()[0])
+	})
+
+	t.Run("ShiftInBigPage", func(t *testing.T) {
+		target := NewBuffer()
+		// 此时 b 起始是大页，长度 4596 (1 Big + 500B)
+		b.ShiftTo(1000, target) // 在第一个大页中间切分
+
+		require.Equal(t, 1000, target.Len())
+		require.False(t, target.hasSmall)
+		require.Equal(t, 3596, b.Len())
+		require.Equal(t, 1000, b.firstPageOffset)
+		require.Equal(t, byte('b'), b.Bytes()[0])
+	})
+}
+
+func TestBuffer_Discard(t *testing.T) {
+	// 为了确保测试覆盖 hasSmall=true 的场景，我们需要分两次写入
+	// 第一次写一个小数据占用 small，第二次写大数据触发 big
+	b := NewBuffer()
+	b.Write([]byte("init")) // 占用 small，此时 b.hasSmall 恒为 true
+
+	// 构造后续的大页数据
+	data := make([]byte, SmallChunkSize+ChunkSize*2)
+	b.Write(data)
+
+	require.True(t, b.hasSmall, "应该持有 small 页")
+
+	t.Run("DiscardWithinSmall", func(t *testing.T) {
+		// 初始 "init" 占 4 字节，FPO 为 0
+		b.Discard(2)
+		require.Equal(t, 2, b.firstPageOffset)
+		require.True(t, b.hasSmall)
+	})
+
+	t.Run("DiscardCrossPageAndVerifyRelease", func(t *testing.T) {
+		// 此时 b.hasSmall 为 true，FPO 为 2
+		// 我们要丢弃剩余的 small (254字节) + 整个 Big1 (4096字节) + Big2 的前 10 字节
+		initialBigCount := len(b.big)
+
+		discardLen := (SmallChunkSize - 2) + ChunkSize + 10
+		b.Discard(discardLen)
+
+		require.False(t, b.hasSmall, "跨过 small 后 hasSmall 应为 false")
+		require.Equal(t, 10, b.firstPageOffset, "FPO 应该是相对于 Big2 的 10")
+		require.Equal(t, initialBigCount-1, len(b.big), "Big1 应该已被物理释放")
+	})
+
+	t.Run("DiscardAll", func(t *testing.T) {
+		b.Discard(b.Len())
+		require.Equal(t, 0, b.Len())
+		require.True(t, b.hasSmall, "Reset 后应恢复 hasSmall")
+		// 如果你的 Reset 实现是将 big 置为 nil：
+		require.Nil(t, b.big)
+		require.Equal(t, 0, b.capacity)
+	})
+}
+
+func TestBuffer_Discard2(t *testing.T) {
+	t.Run("DiscardWithinSmall", func(t *testing.T) {
+		b := NewBuffer()
+		b.Write([]byte("0123456789")) // 10字节，在small页
+		b.Discard(4)
+
+		require.Equal(t, 6, b.Len())
+		require.Equal(t, 4, b.firstPageOffset)
+		require.True(t, b.hasSmall)
+		require.Equal(t, []byte("456789"), b.Bytes())
+	})
+
+	t.Run("DiscardCrossSmallToBig", func(t *testing.T) {
+		b := NewBuffer()
+		// 构造：Small(256B) + Big(4096B)
+		p1 := make([]byte, SmallChunkSize)
+		p2 := make([]byte, 100)
+		for i := range p1 {
+			p1[i] = 'a'
+		}
+		for i := range p2 {
+			p2[i] = 'b'
+		}
+		b.Write(p1)
+		b.Write(p2)
+
+		// 丢弃全部 Small + Big 的前 10 字节
+		b.Discard(SmallChunkSize + 10)
+
+		require.Equal(t, 90, b.Len())
+		require.False(t, b.hasSmall, "应该已经禁用 small 页")
+		require.Equal(t, 10, b.firstPageOffset, "偏移量应相对于 Big 页起始位")
+		require.Equal(t, byte('b'), b.Bytes()[0])
+	})
+
+	t.Run("DiscardBigOnlyMode", func(t *testing.T) {
+		// 模拟大对象直接禁用 small 的情况
+		b := NewBuffer()
+		payload := make([]byte, ChunkSize+500)
+		b.Write(payload) // 此时 b.hasSmall 应为 false
+		require.False(t, b.hasSmall)
+
+		b.Discard(ChunkSize + 10)
+		require.Equal(t, 490, b.Len())
+		require.Equal(t, 10, b.firstPageOffset)
+		require.Equal(t, 1, len(b.big), "第一页 Big 应该已被物理回收")
+	})
+}
+
+func TestBuffer_Discard_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
+	// 1. 构造 Big-only 模式 (首次写入 > 256B)
+	buf := NewBuffer()
+	payload := make([]byte, ChunkSize+100)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	buf.Write(payload)
+	require.False(t, buf.hasSmall)
+
+	// 2. 丢弃到第一页大页的末尾，使得剩余数据 <= SmallChunkSize
+	// 剩余数据长度设为 SmallChunkSize / 2 (128B)
+	suffixLen := SmallChunkSize / 2
+	discardLen := ChunkSize - suffixLen
+
+	buf.Discard(discardLen)
+
+	// 验证：丢弃后 b 应该进入了第一页大页的后半段
+	require.False(t, buf.hasSmall, "Discard 不应主动开启 hasSmall，除非 Reset")
+	require.Equal(t, suffixLen+100, buf.Len())
+	require.Equal(t, discardLen, buf.firstPageOffset)
+	require.Equal(t, payload[discardLen:], buf.Bytes())
+
+	buf.Free()
+}
+
+func TestBuffer_DataIntegrityAfterDiscard(t *testing.T) {
+	b := NewBuffer()
+	raw := []byte("0123456789")
+	// 循环写入使其跨页
+	for i := 0; i < 500; i++ {
+		b.Write(raw)
+	}
+
+	total := b.Bytes()
+
+	// 随机丢弃一段长度
+	discardLen := 300
+	b.Discard(discardLen)
+
+	require.Equal(t, total[discardLen:], b.Bytes())
+}
+
+func TestBuffer_ShiftTo_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
+	// 1. 构造 Big-only 模式
+	buf := NewBuffer()
+	payload := make([]byte, ChunkSize+500) // 4096 + 500
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	buf.Write(payload)
+	require.False(t, buf.hasSmall)
+
+	// 2. 将数据切分给 target，切分点选在第一页大页的末尾
+	// 使得 target 拿到的数据量 <= SmallChunkSize (例如 128B)
+	shiftLen := ChunkSize + 500 - SmallChunkSize/2
+	target := NewBuffer()
+
+	// 执行移出操作
+	buf.ShiftTo(shiftLen, target)
+
+	// 验证 target (接收了头部的 128B)
+	require.False(t, target.hasSmall)
+	require.Equal(t, shiftLen, target.Len())
+	require.Equal(t, payload[:shiftLen], target.Bytes())
+	require.Equal(t, 0, target.firstPageOffset)
+
+	// 验证 buf (保留了剩余部分)
+	require.Equal(t, 128, buf.firstPageOffset)
+	require.Equal(t, ChunkSize+500-shiftLen, buf.Len())
+	require.Equal(t, payload[shiftLen:], buf.Bytes())
+	require.True(t, buf.hasSmall, "小段数据移出应优先填充 target 的 small 数组")
+
+	target.Free()
+	buf.Free()
+}
+
+func TestBuffer_ShiftTo2(t *testing.T) {
+	t.Run("ShiftSmallToTarget", func(t *testing.T) {
+		b := NewBuffer()
+		b.Write([]byte("header_body")) // 11字节
+
+		target := NewBuffer()
+		b.ShiftTo(6, target) // 切出 "header"
+
+		require.Equal(t, 6, target.Len())
+		require.Equal(t, []byte("header"), target.Bytes())
+		require.True(t, target.hasSmall)
+
+		require.Equal(t, 5, b.Len())
+		require.Equal(t, []byte("_body"), b.Bytes())
+	})
+
+	t.Run("ShiftBigSuffixToTarget", func(t *testing.T) {
+		// 构造 Big-Only 模式
+		b := NewBuffer()
+		payload := make([]byte, ChunkSize+200)
+		for i := range payload {
+			payload[i] = byte(i % 256)
+		}
+		b.Write(payload)
+
+		// 此时 b.hasSmall 为 false, 拥有 2 个 Big Chunk
+		require.False(t, b.hasSmall)
+
+		target := NewBuffer()
+		// 从头部切掉 100 字节
+		b.ShiftTo(100, target)
+
+		require.Equal(t, 100, target.Len())
+		require.False(t, target.hasSmall)
+		require.Equal(t, 0, target.firstPageOffset)
+
+		require.Equal(t, ChunkSize+100, b.Len())
+		require.Equal(t, 100, b.firstPageOffset)
+		require.Equal(t, payload[100:], b.Bytes())
+	})
+
+	t.Run("ShiftAllToTarget", func(t *testing.T) {
+		b := NewBuffer()
+		b.Write([]byte("full_data"))
+
+		target := NewBuffer()
+		b.ShiftTo(b.Len(), target)
+
+		require.Equal(t, 0, b.Len())
+		require.Equal(t, 9, target.Len())
+		require.Equal(t, []byte("full_data"), target.Bytes())
+	})
+}
+
+func TestBuffer_ComplexOperations(t *testing.T) {
+	b := NewBuffer()
+	// 填充 10KB 数据
+	data := make([]byte, 10240)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	b.Write(data)
+
+	// 1. 丢弃一部分
+	b.Discard(1000)
+	// 2. 移出一部分给 cmd
+	cmdRaw := NewBuffer()
+	b.ShiftTo(2000, cmdRaw)
+
+	// 3. 验证剩余部分
+	require.Equal(t, 10240-1000-2000, b.Len())
+	require.Equal(t, data[3000:], b.Bytes())
+
+	// 4. 验证移出部分
+	require.Equal(t, data[1000:3000], cmdRaw.Bytes())
+}
+
+func TestShiftTo_Isolation(t *testing.T) {
+	// 1. 初始化环境：确保数据跨越 SmallChunk 並进入 BigChunk
+	b := NewBuffer() // 假設初始化函數
+
+	// 寫入足夠数据：1个 SmallChunk + 1个 BigChunk
+	data1 := make([]byte, SmallChunkSize)
+	for i := range data1 {
+		data1[i] = 'A'
+	}
+	b.Write(data1)
+
+	data2 := make([]byte, ChunkSize)
+	for i := range data2 {
+		data2[i] = 'B'
+	}
+	b.Write(data2)
+
+	// 当前布局：[AAAA... (Small)] [BBBB... (BigIdx 0)]
+	// 总长度：SmallChunkSize + ChunkSize
+
+	// 2. 执行 ShiftTo：在大页中间截斷
+	// 目标：移走 SmallChunk + 半个 BigChunk
+	shiftLen := SmallChunkSize + (ChunkSize / 2)
+	target := NewBuffer()
+	b.ShiftTo(shiftLen, target)
+
+	// 3. 获取 target 和 b 的內容视图（假设有 Bytes() 方法或类似读取方式）
+	// 此時 target 应该持有原始 BigChunk 的前半段 'B'
+	// b 应该持有原始 BigChunk 的后半段 'B'
+
+	targetBytes := target.Bytes()
+	bBytes := b.Bytes()
+
+	// 4. 【关键点】修改原 Buffer b 的数据
+	// 既然要求物理隔离，修改 b 不應影响 target
+	bBytes[0] = 'X' // 修改它
+
+	// 5. 验证隔离
+	// 检查 target 的末尾字节（即拆分点前的最后一个字节）
+	targetLastByte := targetBytes[len(targetBytes)-1]
+
+	if targetLastByte == 'X' {
+		t.Errorf("物理隔离失敗！修改原 Buffer 影响了 target。targetLastByte: %c", targetLastByte)
+	} else if targetLastByte == 'B' {
+		t.Logf("物理隔离成功：target 数据保持为 '%c'，不受原 Buffer 修改为 'X' 的影响", targetLastByte)
+	} else {
+		t.Errorf("数据错误：預期 'B'，实际 '%c'", targetLastByte)
+	}
+
+	// 6. 验证指針地址（進階）
+	// 如果底层是 []*Chunk，可以反射检查指針是否相同
 }

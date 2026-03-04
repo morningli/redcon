@@ -5,10 +5,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/stretchr/testify/require"
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestRespond_Data(t *testing.T) {

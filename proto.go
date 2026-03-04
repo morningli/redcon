@@ -229,101 +229,128 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 
 func (r *Respond) readUntilCRLF(rd *bufio.Reader) (BufferView, error) {
 	start := r.Buffer.Len()
-	var lastChar byte // 缓存上一个写入的字节，用于跨循环检查 \r\n
+	// Fast Path: 尝试单次读取。如果一行就在 bufio 缓存内且包含 \r\n，直接处理。
+	line, err := rd.ReadSlice('\n')
+	if err == nil && len(line) >= 2 && line[len(line)-2] == '\r' {
+		// 物理写入 (内联 Buffer 写入逻辑以消除调用开销)
+		r.writeToBuffer(line)
+		return r.Buffer.Tail(start), nil
+	}
+	// Slow Path: 跨缓存块、ErrBufferFull 或非 \r\n 结尾
+	return r.readUntilCRLFSlow(rd, start, line, err)
+}
 
+//go:noinline
+func (r *Respond) readUntilCRLFSlow(rd *bufio.Reader, start int, firstLine []byte, firstErr error) (BufferView, error) {
+	line, err := firstLine, firstErr
+	var lastChar byte
 	for {
-		// 1. 利用 bufio 的 ReadSlice 寻找行尾 \n
-		line, err := rd.ReadSlice('\n')
-		if err != nil && err != bufio.ErrBufferFull {
-			return BufferView{}, err
-		}
-
-		nLine := len(line)
-		if nLine > 0 {
-			// 【核心优化】更新 lastChar。
-			// 如果 nLine >= 2，lastChar 更新为 \n 前的那一位。
-			// 如果 nLine == 1，lastChar 保持为上一轮循环写入 Buffer 的最后一个字节。
-			if nLine >= 2 {
-				lastChar = line[nLine-2]
+		if len(line) > 0 {
+			if len(line) >= 2 {
+				lastChar = line[len(line)-2]
 			}
-
-			// 2. 精准物理写入逻辑 (保持原有高效 Copy)
-			remLine := line
-			for len(remLine) > 0 {
-				dest := r.Buffer.Reserve(len(remLine))
-				n := copy(dest, remLine)
-				r.Buffer.Advance(n)
-				remLine = remLine[n:]
-			}
+			r.writeToBuffer(line)
 		}
-
-		// 3. RESP 协议匹配逻辑
 		if err == nil {
-			// 此时最后一位必定是 \n。
-			// 无论 \r 是在当前 line 中，还是在上一轮循环的末尾，
-			// 此时的 lastChar 寄存器里存的一定是 \n 前面的那一位。
 			if lastChar == '\r' {
 				return r.Buffer.Tail(start), nil
 			}
-
-			// 如果不是 \r\n，将 lastChar 更新为 \n，继续寻找
 			lastChar = '\n'
+		} else if err != bufio.ErrBufferFull {
+			return BufferView{}, err
 		}
+		line, err = rd.ReadSlice('\n')
 	}
 }
 
 // readRespLen 在将原始数据存入 Buffer 的同时，实时解析其代表的长度值
 func (r *Respond) readRespLen(rd *bufio.Reader) (int, error) {
-	var (
-		n          int
-		isNegative bool
-		digitCount int
-		lastChar   byte
-	)
+	line, err := rd.ReadSlice('\n')
+	// Fast Path: 常见的 RESP 整数（如 :10\r\n 或 $5\r\n），通常在 12 字节内
+	if err == nil && len(line) >= 3 && line[len(line)-2] == '\r' {
+		// 尝试快速解析数字 (不包含负数处理以保持精简)
+		if line[0] >= '0' && line[0] <= '9' {
+			val := 0
+			isNum := true
+			for i := 0; i < len(line)-2; i++ {
+				c := line[i]
+				if c >= '0' && c <= '9' {
+					val = val*10 + int(c-'0')
+				} else {
+					isNum = false
+					break
+				}
+			}
+			if isNum {
+				r.writeToBuffer(line)
+				return val, nil
+			}
+		}
+	}
+	// Slow Path: 负数、长数字、跨块读取
+	return r.readRespLenSlow(rd, line, err)
+}
+
+//go:noinline
+func (r *Respond) readRespLenSlow(rd *bufio.Reader, firstLine []byte, firstErr error) (int, error) {
+	var n, digitCount int
+	var isNegative bool
+	var lastChar byte
+	line, err := firstLine, firstErr
 
 	for {
-		line, err := rd.ReadSlice('\n')
-		nLine := len(line)
-
-		if nLine > 0 {
-			// 1. 物理写入 Buffer
-			remLine := line
-			for len(remLine) > 0 {
-				dest := r.Buffer.Reserve(len(remLine))
-				c := copy(dest, remLine)
-				r.Buffer.Advance(c)
-				remLine = remLine[c:]
-			}
-
-			// 2. 实时解析 (利用本地变量 line 避免多次访问 Buffer)
-			for i := 0; i < nLine; i++ {
-				b := line[i]
-				if b >= '0' && b <= '9' {
-					n = n*10 + int(b-'0')
+		if len(line) > 0 {
+			r.writeToBuffer(line)
+			for i := 0; i < len(line); i++ {
+				char := line[i]
+				if char >= '0' && char <= '9' {
+					n = n*10 + int(char-'0')
 					digitCount++
-				} else if b == '-' && digitCount == 0 {
+				} else if char == '-' && digitCount == 0 {
 					isNegative = true
 					digitCount++
-				} else if b == '\n' && lastChar == '\r' {
-					// 匹配成功
+				} else if char == '\n' && lastChar == '\r' {
 					if isNegative {
 						if n == 1 && digitCount == 2 {
 							return -1, nil
 						}
-						return 0, errors.New("redis: ERR invalid length")
+						return 0, errInvalidLength
 					}
 					return n, nil
 				}
-				lastChar = b
+				lastChar = char
 			}
 		}
-
-		if err != nil {
-			if err == bufio.ErrBufferFull {
-				continue
-			}
+		if err != nil && err != bufio.ErrBufferFull {
 			return 0, err
 		}
+		line, err = rd.ReadSlice('\n')
+	}
+}
+
+// 建议在 Respond 结构体下增加此辅助方法，编译器会将其内联到上述 Fast Path 中
+func (r *Respond) writeToBuffer(line []byte) {
+	b := r.Buffer
+	// 只有确定是 Small 模式才去算 pLen，对非 Small 模式更友好
+	if b.hasSmall && b.small != nil {
+		pLen := b.length + b.firstPageOffset
+		if pLen+len(line) <= SmallChunkSize {
+			copy(b.small[pLen:], line)
+			b.length += len(line)
+			return
+		}
+	}
+	r.bufferWriteSlow(line)
+}
+
+//go:noinline
+func (r *Respond) bufferWriteSlow(line []byte) {
+	remLine := line
+	for len(remLine) > 0 {
+		dest := r.Buffer.Reserve(len(remLine))
+		n := copy(dest, remLine)
+		r.Buffer.Advance(n)
+		remLine = remLine[n:]
 	}
 }
 

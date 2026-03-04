@@ -321,24 +321,16 @@ func (b *Buffer) Tail(n int) BufferView {
 // Split 在 n 位置切断数据。
 // 原有的 b 将保留 [0, n) 字节（完整指令，通过拷贝分割点实现物理隔离）。
 // 返回的新 Buffer 将承接 [n, length) 字节（剩余流，通过位移实现零平移）。
-func (b *Buffer) Split(n int) *Buffer {
+func (b *Buffer) Split(n int, newBuf *Buffer) {
 	if n <= 0 {
 		// 情况：n=0，原 b 变为空，所有数据移交给新返回的 Buffer
-		newBuf := &Buffer{
-			small:           b.small,
-			big:             b.big,
-			length:          b.length,
-			firstPageOffset: b.firstPageOffset,
-			hasSmall:        b.hasSmall,
-			capacity:        b.capacity, // 继承总容量
-		}
-		b.small, b.big, b.length, b.firstPageOffset, b.hasSmall, b.capacity = nil, nil, 0, 0, true, 0
-		return newBuf
+		b.Swap(newBuf)
+		return
 	}
 
 	if n >= b.length {
 		// 情况：n 超过长度，b 保留所有，返回一个空的 Buffer
-		return NewBuffer()
+		return
 	}
 
 	originalSmall := b.small
@@ -348,7 +340,6 @@ func (b *Buffer) Split(n int) *Buffer {
 	originalHasSmall := b.hasSmall
 
 	splitPos := n + originalFPO
-	newBuf := NewBuffer()
 	newLen := originalLen - n
 
 	// prefix is the size of the first page in bytes (small page when present).
@@ -391,7 +382,7 @@ func (b *Buffer) Split(n int) *Buffer {
 			newBuf.length = newLen
 			// 更新 newBuf.capacity: 计算方式同 ensureCapacity
 			newBuf.capacity = calculateCapacity(newBuf.hasSmall, len(newBuf.big))
-			return newBuf
+			return
 		}
 
 		// Boundary right after small page
@@ -408,7 +399,7 @@ func (b *Buffer) Split(n int) *Buffer {
 			newBuf.firstPageOffset = 0
 			newBuf.length = newLen
 			newBuf.capacity = calculateCapacity(false, len(newBuf.big))
-			return newBuf
+			return
 		}
 	}
 
@@ -438,7 +429,7 @@ func (b *Buffer) Split(n int) *Buffer {
 		newBuf.firstPageOffset = 0
 		newBuf.length = newLen
 		newBuf.capacity = len(newBuf.big) * ChunkSize
-		return newBuf
+		return
 	}
 
 	// Split within a big page: copy suffix to a fresh first page for newBuf.
@@ -459,7 +450,198 @@ func (b *Buffer) Split(n int) *Buffer {
 	}
 	newBuf.length = newLen
 	newBuf.capacity = calculateCapacity(newBuf.hasSmall, len(newBuf.big))
-	return newBuf
+	return
+}
+
+// ShiftTo 从 b 的头部切出 n 字节转移到 target，b 仅保留剩余部分。
+// 这是解析 Redis 命令时提取 Raw 原始报文的高效路径。
+func (b *Buffer) ShiftTo(n int, newBuf *Buffer) {
+	if n <= 0 {
+		// 情况：n=0，b 保留所有，返回一个空的 Buffer
+		return
+	}
+
+	if n >= b.length {
+		// 情况：n 超过长度，原 b 变为空，所有数据移交给新返回的 Buffer
+		b.Swap(newBuf)
+		return
+	}
+
+	originalSmall := b.small
+	originalBig := b.big
+	originalLen := b.length
+	originalFPO := b.firstPageOffset
+	originalHasSmall := b.hasSmall
+
+	splitPos := n + originalFPO
+	newLen := originalLen - n
+
+	// prefix is the size of the first page in bytes (small page when present).
+	prefix := 0
+	if originalHasSmall {
+		prefix = SmallChunkSize
+	}
+
+	if originalHasSmall {
+		// Split in small page
+		if splitPos < SmallChunkSize {
+			// b keeps the original small page (no copy); newBuf gets a fresh small page for suffix.
+			newBuf.small = originalSmall
+			newBuf.big = nil
+			newBuf.hasSmall = true
+			newBuf.length = n
+			// b.firstPageOffset unchanged
+			newBuf.firstPageOffset = originalFPO
+			newBuf.capacity = SmallChunkSize // b 仅剩 small
+
+			// newBuf: allocate a new small page and copy the suffix bytes into the END part.
+			suffixLen := min(SmallChunkSize-splitPos, newLen)
+			suffix := originalSmall[splitPos : splitPos+suffixLen]
+			newHasSmall, newSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix)
+			b.hasSmall = newHasSmall
+			b.small = newSmall
+			b.firstPageOffset = newFirstOff
+
+			// 继承后续大页
+			if len(newBigFirst) > 0 {
+				// Should never happen since suffixLen <= SmallChunkSize, but keep consistent.
+				b.big = append(newBigFirst, originalBig...)
+			} else {
+				b.big = originalBig
+			}
+			b.length = newLen
+			// 更新 newBuf.capacity: 计算方式同 ensureCapacity
+			b.capacity = calculateCapacity(newBuf.hasSmall, len(newBuf.big))
+			return
+		}
+
+		// Boundary right after small page
+		if splitPos == SmallChunkSize {
+			newBuf.small = originalSmall
+			newBuf.big = nil
+			newBuf.hasSmall = true
+			newBuf.length = n
+			newBuf.capacity = SmallChunkSize
+			newBuf.firstPageOffset = originalFPO
+
+			b.small = nil
+			b.big = originalBig
+			b.hasSmall = false
+			b.firstPageOffset = 0
+			b.length = newLen
+			b.capacity = calculateCapacity(false, len(newBuf.big))
+			return
+		}
+	}
+
+	// Split in big pages (shared for hasSmall=true and hasSmall=false).
+	bigSplitPos := splitPos - prefix
+	splitBigIdx := bigSplitPos >> bigShift
+	innerOff := bigSplitPos & bigMask
+
+	// b keeps pages up to the boundary page; remainder never reuses the boundary page.
+	newBuf.small = originalSmall
+	newBuf.hasSmall = originalHasSmall
+	if innerOff > 0 {
+		newBuf.big = append([]*Chunk(nil), originalBig[:splitBigIdx+1]...)
+		newBuf.capacity = prefix + (splitBigIdx+1)*ChunkSize
+	} else {
+		newBuf.big = append([]*Chunk(nil), originalBig[:splitBigIdx]...)
+		newBuf.capacity = prefix + (splitBigIdx)*ChunkSize
+	}
+	newBuf.length = n
+	newBuf.firstPageOffset = originalFPO
+
+	if innerOff == 0 {
+		// Boundary on big page edge: remainder can take pages without copying.
+		b.small = nil
+		b.hasSmall = false
+		b.big = originalBig[splitBigIdx:]
+		b.firstPageOffset = 0
+		b.length = newLen
+		b.capacity = len(newBuf.big) * ChunkSize
+		return
+	}
+
+	// Split within a big page: copy suffix to a fresh first page for newBuf.
+	suffixInThisPage := min(ChunkSize-innerOff, newLen)
+	fmt.Printf("suffixInThisPage %d\n", suffixInThisPage)
+	suffix := originalBig[splitBigIdx][innerOff : innerOff+suffixInThisPage]
+	newHasSmall, newSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix)
+	fmt.Printf("newHasSmall %v, newFirstOff %d\n", newHasSmall, newFirstOff)
+	b.hasSmall = newHasSmall
+	b.small = newSmall
+	b.firstPageOffset = newFirstOff
+	if splitBigIdx+1 < len(originalBig) {
+		if len(newBigFirst) > 0 {
+			b.big = append(newBigFirst, originalBig[splitBigIdx+1:]...)
+		} else {
+			b.big = originalBig[splitBigIdx+1:]
+		}
+	} else {
+		b.big = newBigFirst
+	}
+	b.length = newLen
+	b.capacity = calculateCapacity(newBuf.hasSmall, len(newBuf.big))
+	return
+}
+
+// Discard 从 Buffer 头部直接丢弃 n 字节数据，并立即释放不再被引用的物理大页。
+func (b *Buffer) Discard(n int) {
+	if n <= 0 {
+		return
+	}
+	if n >= b.length {
+		b.Free()
+		return
+	}
+
+	// 1. 记录原始状态
+	origFPO := b.firstPageOffset
+	origHasSmall := b.hasSmall
+	origBig := b.big
+
+	// 计算物理上的总偏移點
+	splitPos := n + origFPO
+	b.length -= n
+
+	if origHasSmall {
+		// --- 情況 A: 丢弃后新起点仍在 Small 页內 ---
+		if splitPos < SmallChunkSize {
+			b.firstPageOffset = splitPos
+			// 確保 hasSmall 保持為 true
+			b.hasSmall = true
+			return
+		}
+
+		// --- 情況 B: 跨过 Small 页進入 Big 区域 ---
+		// 必須減去 SmallChunkSize。
+		bigSplitPos := splitPos - SmallChunkSize
+		splitBigIdx := bigSplitPos >> bigShift
+		innerOff := bigSplitPos & bigMask
+
+		// 物理回收被完全跳过的大页
+		for i := 0; i < splitBigIdx; i++ {
+			putBigChunk(origBig[i])
+		}
+
+		b.hasSmall = false
+		b.firstPageOffset = innerOff
+		b.big = origBig[splitBigIdx:]
+		b.capacity = len(b.big) * ChunkSize
+	} else {
+		// --- 情況 C: 本來就在 Big 区域 ---
+		splitBigIdx := splitPos >> bigShift
+		innerOff := splitPos & bigMask
+
+		for i := 0; i < splitBigIdx; i++ {
+			putBigChunk(origBig[i])
+		}
+
+		b.firstPageOffset = innerOff
+		b.big = origBig[splitBigIdx:]
+		b.capacity = len(b.big) * ChunkSize
+	}
 }
 
 // 辅助函数，避免重复逻辑。建议内联。
@@ -487,6 +669,7 @@ func (b *Buffer) Free() {
 	b.big = nil
 	b.length = 0
 	b.firstPageOffset = 0
+	b.hasSmall = true
 	b.capacity = 0
 }
 
