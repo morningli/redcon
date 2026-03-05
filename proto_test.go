@@ -369,21 +369,6 @@ func testParseBulk(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
-func TestFastParseInt_Simple(t *testing.T) {
-	// 模拟一個 BufferView (单页 Fast-Path 覆盖)
-	small := &SmallChunk{}
-	copy(small[10:], "-12345")
-	v := BufferView{hasSmall: true, small: small, firstPageOffset: 10, length: 6}
-
-	val, err := fastParseInt(v)
-	if err != nil {
-		t.Fatalf("解析失败: %v", err)
-	}
-	if val != -12345 {
-		t.Errorf("期望 -12345, 得到 %d", val)
-	}
-}
-
 func TestDecodeStream_DeepArray(t *testing.T) {
 	// 構造一個嵌套 Array: *2\r\n$3\r\nGET\r\n*1\r\n$4\r\nINFO\r\n
 	data := []byte("*2\r\n$3\r\nGET\r\n*1\r\n$4\r\nINFO\r\n")

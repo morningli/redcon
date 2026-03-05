@@ -216,7 +216,7 @@ func (rd *Reader) readCommands(leftover *int) ([]*Request, error) {
 	if rd.rd == nil {
 		return nil, errIncompleteCommand
 	}
-	_, err := rd.buf.ReadFrom(rd.rd)
+	_, err := rd.buf.ReadBuffered(rd.rd)
 	if err != nil {
 		return nil, err
 	}

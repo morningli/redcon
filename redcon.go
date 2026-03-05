@@ -19,6 +19,7 @@ var (
 	errDetached               = errors.New("detached")
 	errIncompleteCommand      = errors.New("incomplete command")
 	errTooMuchData            = errors.New("too much data")
+	errNotServing             = errors.New("not serving")
 )
 
 const maxBufferCap = 262144
@@ -91,7 +92,7 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ln == nil {
-		return errors.New("not serving")
+		return errNotServing
 	}
 	s.done = true
 	err := s.ln.Close()
@@ -118,7 +119,7 @@ func (s *TLSServer) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ln == nil {
-		return errors.New("not serving")
+		return errNotServing
 	}
 	s.done = true
 	return s.ln.Close()

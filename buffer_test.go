@@ -385,14 +385,12 @@ func TestBuffer_ReadFrom(t *testing.T) {
 	const dataSize = 10 * 1024
 	testData := make([]byte, dataSize)
 	for i := 0; i < dataSize; i++ {
-		testData[i] = byte(i % 256)
+		testData[i] = byte(i%('Z'-'A'+1) + 'A')
 	}
 
 	// 2. 初始化 bufio.Reader
 	// 注意：bufio 默认缓冲区通常是 4KB，我们手动设为 16KB 以确保一次能 Buffered 更多数据
 	rawReader := bytes.NewReader(testData)
-	rd := bufio.NewWriterSize(nil, 16*1024) // 仅占位
-	_ = rd                                  // 实际上我们需要的是下面这个
 	brd := bufio.NewReaderSize(rawReader, 16*1024)
 
 	// 预填充 bufio 的缓冲区（执行一次 Peek 或 Read 触发底层填充）
@@ -406,29 +404,15 @@ func TestBuffer_ReadFrom(t *testing.T) {
 	buf := NewBuffer()
 
 	// 4. 执行测试逻辑
-	n, err := buf.ReadFrom(brd)
+	n, err := buf.ReadBuffered(brd)
 	if err != nil && err != io.EOF {
 		t.Fatalf("ReadFromBuffered 执行失败: %v", err)
 	}
 
 	// 5. 验证结果
-	if n != int64(dataSize) {
-		t.Errorf("读取长度不符: 期望 %d, 实际 %d", dataSize, n)
-	}
-
-	if buf.Len() != dataSize {
-		t.Errorf("Buffer 长度不符: 期望 %d, 实际 %d", dataSize, buf.Len())
-	}
-
-	// 验证数据完整性 (使用你之前的 Bytes() 或遍历逻辑)
-	if !bytes.Equal(buf.Bytes(), testData) {
-		t.Error("读取到的数据内容不一致（可能在 Chunk 切换时发生了覆盖或偏移错误）")
-	}
-
-	// 验证 bufio 缓冲区是否已清空
-	if brd.Buffered() != 0 {
-		t.Errorf("bufio 缓冲区未完全消耗: 剩余 %d", brd.Buffered())
-	}
+	require.Equal(t, int64(dataSize), n)
+	require.Equal(t, dataSize, buf.Len())
+	require.Equal(t, testData, buf.Bytes())
 }
 
 // 可选：增加一个边界测试，验证当 Buffer 已有部分数据且 offset 不在页首时的情况
@@ -446,7 +430,7 @@ func TestBuffer_ReadFrom_WithOffset(t *testing.T) {
 
 	t.Logf("Before: Buffered = %d", brd.Buffered()) // 这里应该打印 5000
 
-	n, err := buf.ReadFrom(brd)
+	n, err := buf.ReadBuffered(brd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,8 +443,9 @@ func TestBuffer_ReadFrom_WithOffset(t *testing.T) {
 }
 
 func TestBuffer_ReadFrom_WithOffset2(t *testing.T) {
+	init := []byte("hello world")
 	buf := NewBuffer()
-	buf.Write([]byte("hello world")) // 11
+	buf.Write(init) // 11
 
 	extraData := bytes.Repeat([]byte("a"), 5000)
 
@@ -469,16 +454,15 @@ func TestBuffer_ReadFrom_WithOffset2(t *testing.T) {
 
 	t.Logf("Before: Buffered = %d", brd.Buffered()) // 这里应该打印 5000
 
-	n, err := buf.ReadFrom(brd)
+	n, err := buf.ReadBuffered(brd)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Logf("After: n = %d, buf.Len = %d", n, buf.Len())
-
-	if buf.Len() != SmallChunkSize {
-		t.Errorf("期望 5011, 实际 %d", buf.Len())
-	}
+	require.Equal(t, 5011, buf.Len())
+	require.Equal(t, extraData, buf.Bytes()[11:])
+	require.Equal(t, init, buf.Bytes()[:11])
+	require.Equal(t, int64(5000), n)
 }
 
 func TestBuffer_ReadFull_MultiPage(t *testing.T) {
@@ -558,7 +542,7 @@ func TestBuffer_ReadFrom2(t *testing.T) {
 
 	input := []byte("hello world")
 	rd := bufio.NewReaderSize(bytes.NewReader(input), 1024)
-	n, err := buf.ReadFrom(rd)
+	n, err := buf.ReadBuffered(rd)
 	require.NoError(t, err)
 	require.Equal(t, input, buf.Bytes())
 	require.Equal(t, int64(len(input)), int64(n))

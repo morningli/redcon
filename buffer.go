@@ -2,8 +2,6 @@ package redcon
 
 import (
 	"bufio"
-	"errors"
-	"fmt"
 	"io"
 	"sync"
 )
@@ -72,7 +70,7 @@ type Buffer struct {
 func NewBuffer() *Buffer {
 	return &Buffer{
 		hasSmall: true,
-		capacity: 0, // 初始容量为 256
+		capacity: 0, //
 		big:      make([]*Chunk, 0, initBigPageCount),
 	}
 }
@@ -103,49 +101,50 @@ func dataSlice(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset, 
 		return nil
 	}
 
-	// --- 1. 快速路径：判断是否为单页连续数据 (0 分配) ---
+	// 极简 Fast Path：只保留最核心的“单页判断”
+	// 减少变量声明，直接在 if 中计算，降低 AST cost
 	if hasSmall {
-		// 数据完全在 SmallChunk 内部 (0 ~ 255)
-		if firstPageOffset+length <= SmallChunkSize {
+		if small != nil && firstPageOffset+length <= SmallChunkSize {
 			return small[firstPageOffset : firstPageOffset+length]
 		}
 	} else if len(big) > 0 {
-		// 数据完全在第一个 BigChunk 内部 (0 ~ 4095)
 		if firstPageOffset+length <= ChunkSize {
 			return big[0][firstPageOffset : firstPageOffset+length]
 		}
 	}
 
-	// --- 2. 慢速路径：跨页场景 (必须分配并合并) ---
-	// 此时 pprof 中的 mallocgc 无法避免，但仅在处理大包或极端跨页时触发
+	// 所有跨页、分配、循环逻辑全部剥离
+	return dataSliceSlow(hasSmall, small, big, firstPageOffset, length)
+}
+
+//go:noinline
+func dataSliceSlow(hasSmall bool, small *SmallChunk, big []*Chunk, fpo, length int) []byte {
 	res := make([]byte, length)
-	remaining := length
-	currOff := firstPageOffset
+	rem := length
+	currOff := fpo
 	destOff := 0
 
-	// 处理 SmallChunk 剩余部分
-	if hasSmall {
+	if hasSmall && small != nil {
 		canRead := SmallChunkSize - currOff
-		actualRead := min(canRead, remaining)
-		copy(res[destOff:], small[currOff:currOff+actualRead])
-
-		remaining -= actualRead
-		destOff += actualRead
-		currOff = 0 // 后续 BigChunk 从 0 开始读
-	}
-
-	// 顺序拷贝 BigChunks
-	for i := 0; i < len(big) && remaining > 0; i++ {
-		start := currOff
-		canRead := ChunkSize - start
-		actualRead := min(canRead, remaining)
-		copy(res[destOff:], big[i][start:start+actualRead])
-
-		remaining -= actualRead
-		destOff += actualRead
+		if canRead > rem {
+			canRead = rem
+		}
+		copy(res[destOff:], small[currOff:currOff+canRead])
+		rem -= canRead
+		destOff += canRead
 		currOff = 0
 	}
 
+	for i := 0; i < len(big) && rem > 0; i++ {
+		canRead := ChunkSize - currOff
+		if canRead > rem {
+			canRead = rem
+		}
+		copy(res[destOff:], big[i][currOff:currOff+canRead])
+		rem -= canRead
+		destOff += canRead
+		currOff = 0
+	}
 	return res
 }
 
@@ -207,36 +206,31 @@ func dataSlices(hasSmall bool, small *SmallChunk, big []*Chunk, firstPageOffset,
 }
 
 func sliceFromPhysical(hasSmall bool, small *SmallChunk, big []*Chunk, physicalStart, length int) BufferView {
-	if hasSmall {
-		if physicalStart < SmallChunkSize {
-			return BufferView{
-				hasSmall:        true,
-				small:           small,
-				big:             big,
-				length:          length,
-				firstPageOffset: physicalStart,
-			}
-		}
-		off2 := physicalStart - SmallChunkSize
-		startBigIdx := off2 >> bigShift
-		newFirstOff := off2 & bigMask
+	// 1. 处理 Small 区域逻辑
+	if hasSmall && physicalStart < SmallChunkSize {
 		return BufferView{
-			hasSmall:        false,
-			small:           nil,
-			big:             big[startBigIdx:], // 仅拷贝切片头(24字节)，不重分配底层数组
+			hasSmall:        true,
+			small:           small,
+			big:             big,
 			length:          length,
-			firstPageOffset: newFirstOff,
+			firstPageOffset: physicalStart,
 		}
 	}
 
-	startBigIdx := physicalStart >> bigShift
-	newFirstOff := physicalStart & bigMask
+	// 2. 统一处理 Big 区域逻辑 (合并 hasSmall 为 true/false 的 Big 偏移计算)
+	offset := physicalStart
+	if hasSmall {
+		offset -= SmallChunkSize
+	}
+
+	// 提前计算索引，减少 BufferView 初始化时的逻辑权重
+	idx := offset >> bigShift
 	return BufferView{
 		hasSmall:        false,
 		small:           nil,
-		big:             big[startBigIdx:],
+		big:             big[idx:], // 仅 Slice Header 拷贝，0 分配
 		length:          length,
-		firstPageOffset: newFirstOff,
+		firstPageOffset: offset & bigMask,
 	}
 }
 
@@ -339,18 +333,21 @@ func (b *Buffer) writeSlow(p []byte) (int, error) {
 
 //go:inline Slice 模拟 Go 原生切片操作 b[n:m],n: 起始位移 (inclusive),m: 结束位移 (exclusive)
 func (b *Buffer) Slice(n, m int) BufferView {
-	if n < 0 || m < n || m > b.length {
-		panic(fmt.Errorf("index out of range [%d:%d] with length %d", n, m, b.length))
+	// 1. 使用 uint 技巧一次性检查 n < 0, m < n, m > length
+	// 这与 Go 编译器处理切片的底层逻辑一致，节点数最少
+	if uint(n) > uint(m) || uint(m) > uint(b.length) {
+		panic("Buffer: slice index out of range")
 	}
 
 	length := m - n
 	physicalStart := n + b.firstPageOffset
+	// 2. 调用已优化的 sliceFromPhysical
 	return sliceFromPhysical(b.hasSmall, b.small, b.big, physicalStart, length)
 }
 
 //go:inline Tail 返回从 n 到末尾的视图，等价于 Go 切片 b[n:].
 func (b *Buffer) Tail(n int) BufferView {
-	return b.Slice(n, b.Len())
+	return b.Slice(n, b.length)
 }
 
 // Split 在 n 位置切断数据。
@@ -600,10 +597,8 @@ func (b *Buffer) ShiftTo(n int, newBuf *Buffer) {
 
 	// Split within a big page: copy suffix to a fresh first page for newBuf.
 	suffixInThisPage := min(ChunkSize-innerOff, newLen)
-	fmt.Printf("suffixInThisPage %d\n", suffixInThisPage)
 	suffix := originalBig[splitBigIdx][innerOff : innerOff+suffixInThisPage]
 	newHasSmall, newSmall, newBigFirst, newFirstOff := makeSuffixFirstPage(suffix)
-	fmt.Printf("newHasSmall %v, newFirstOff %d\n", newHasSmall, newFirstOff)
 	b.hasSmall = newHasSmall
 	b.small = newSmall
 	b.firstPageOffset = newFirstOff
@@ -720,9 +715,11 @@ func (b *Buffer) Len() int {
 
 //go:inline At 返回逻辑偏移 index 处的单个字节
 func (b *Buffer) At(index int) byte {
-	if index < 0 || index >= b.length {
-		panic(errors.New("index out of range"))
+	// 1. 极简边界检查：利用 uint 一次性判定 index < 0 || index >= v.length
+	if uint(index) >= uint(b.length) {
+		panic("Buffer: slice index out of range")
 	}
+	// 2. 调用物理索引函数（确保 atByte 也是内联的）
 	return atByte(b.hasSmall, b.small, b.big, b.firstPageOffset, index)
 }
 
@@ -756,68 +753,87 @@ func (b *Buffer) Bytes() []byte {
 
 // ensureCapacity 确保至少还能写 n 字节（自动扩容多页）
 func (b *Buffer) ensureCapacity(n int) {
-	needed := b.length + b.firstPageOffset + n
-
-	// 极速路径：空间足够，直接返回
-	if b.capacity >= needed {
+	// Fast Path: 只要物理剩余空间够，立刻返回。
+	// 这里直接用 b.capacity 比较，减少加法节点的生成。
+	if n <= b.capacity-(b.length+b.firstPageOffset) {
 		return
 	}
 
-	// 慢速路径：需要扩容
-	b.grow(needed)
+	// 慢速路径：交给非内联函数处理扩容、页面申请等重逻辑
+	b.grow(n)
 }
 
-func (b *Buffer) grow(needed int) {
-	// If this is the very first write and it's already larger than the small page,
-	// start with a big page and skip allocating the small page.
-	if b.length == 0 && b.firstPageOffset == 0 && b.small == nil && len(b.big) == 0 && b.hasSmall {
-		if needed > SmallChunkSize {
+//go:noinline
+func (b *Buffer) grow(n int) {
+	// 计算当前物理占用
+	physPos := b.length + b.firstPageOffset
+	totalNeeded := physPos + n
+
+	// 1. 特殊场景：首次写入且极大，直接放弃 Small 模式节省内存
+	if physPos == 0 && b.small == nil && len(b.big) == 0 && b.hasSmall {
+		if totalNeeded > SmallChunkSize {
 			b.hasSmall = false
 		}
 	}
 
-	physicalLen := b.length + b.firstPageOffset
-	need := physicalLen + needed
-
-	if b.hasSmall {
-		if b.small == nil {
-			b.small = getSmallChunk()
-		}
+	// 2. 确保 SmallChunk 存在（如果在 Small 模式下）
+	if b.hasSmall && b.small == nil {
+		b.small = getSmallChunk()
 		b.capacity += SmallChunkSize
-		if b.capacity > need {
-			return
-		}
 	}
 
-	// 增加足够的新页
-	for need > b.capacity {
+	// 3. 循环补充 BigChunks
+	// 这里的 b.capacity 必须代表物理总容量（Small + 所有 Big）
+	for b.capacity < totalNeeded {
 		b.big = append(b.big, getBigChunk())
 		b.capacity += ChunkSize
 	}
 }
 
 func (b *Buffer) reserve() []byte {
-	physLen := b.length + b.firstPageOffset
+	pLen := b.length + b.firstPageOffset
+
+	// Fast Path 1: 还在 SmallChunk 范围内且已分配
+	if b.hasSmall && b.small != nil && pLen < SmallChunkSize {
+		return b.small[pLen:]
+	}
+
+	// Fast Path 2: 已经在 BigChunk 且当前页未满
+	if !b.hasSmall && len(b.big) > 0 {
+		innerOff := pLen & bigMask
+		// 只有在当前页还有剩余空间时才内联返回
+		if innerOff < ChunkSize {
+			return b.big[len(b.big)-1][innerOff:]
+		}
+	}
+
+	// 复杂情况：Small未分配、跨页、需分配新页等全部交给 Slow Path
+	return b.reserveSlow(pLen)
+}
+
+//go:noinline
+func (b *Buffer) reserveSlow(pLen int) []byte {
+	if b.hasSmall && pLen < SmallChunkSize {
+		if b.small == nil {
+			b.small = getSmallChunk()
+		}
+		return b.small[pLen:]
+	}
+
 	prefix := 0
 	if b.hasSmall {
 		prefix = SmallChunkSize
 	}
 
-	if b.hasSmall && physLen < SmallChunkSize {
-		// 当前写在 small page
-		if b.small == nil {
-			b.small = getSmallChunk()
-		}
-		innerOff := physLen
-		return b.small[innerOff:]
-	}
+	bigPos := pLen - prefix
+	idx := bigPos >> bigShift
+	off := bigPos & bigMask
 
-	// 写在 big page
-	bigPos := physLen - prefix
-	pageIdx := bigPos >> bigShift
-	innerOff := bigPos & bigMask
-	currPage := b.big[pageIdx]
-	return currPage[innerOff:]
+	// 确保页面存在（逻辑应由调用方通过 ensureCapacity 保证，这里做安全检查）
+	if idx >= len(b.big) {
+		return nil
+	}
+	return b.big[idx][off:]
 }
 
 // Reserve 预留 n 字节，返回当前页中的可写 slice。
@@ -837,79 +853,147 @@ func (b *Buffer) Advance(n int) {
 }
 
 // ReadFull 直接从 bufio.Reader 灌入，绕过 io.Reader 接口
-func (b *Buffer) ReadFull(rd *bufio.Reader, n int) error {
+func (b *Buffer) ReadFull(rd io.Reader, n int) error {
+	// 1. 一次性保证物理空间，避免循环内多次判断 capacity
 	b.ensureCapacity(n)
 
 	read := 0
 	for read < n {
-		// 获取当前页剩余的连续物理空间
-		dest := b.Reserve(n - read)
+		pLen := b.length + b.firstPageOffset
+		var dest []byte
+		var canWrite int
 
-		// 关键点：直接调用结构体方法，消除 assertI2I2 耗时
+		// 2. 定位当前物理写入点（直接内联逻辑，不调用外部函数）
+		if b.hasSmall && pLen < SmallChunkSize {
+			if b.small == nil {
+				b.small = getSmallChunk()
+			}
+			canWrite = SmallChunkSize - pLen
+			// 限制本次读取长度，不可跨越 Small 到 Big 的物理边界
+			limit := n - read
+			if limit > canWrite {
+				limit = canWrite
+			}
+			dest = b.small[pLen : pLen+limit]
+		} else {
+			prefix := 0
+			if b.hasSmall {
+				prefix = SmallChunkSize
+			}
+
+			bigPos := pLen - prefix
+			pageIdx := bigPos >> bigShift
+			innerOff := bigPos & bigMask
+
+			canWrite = ChunkSize - innerOff
+			limit := n - read
+			if limit > canWrite {
+				limit = canWrite
+			}
+			// 确保索引安全（由 ensureCapacity 保证）
+			dest = b.big[pageIdx][innerOff : innerOff+limit]
+		}
+
+		// 3. 执行物理读取
 		nr, err := rd.Read(dest)
 		if nr > 0 {
-			b.Advance(nr)
+			b.length += nr
 			read += nr
 		}
 		if err != nil {
+			// ReadFull 语义：读不到期望长度即报错
 			return err
 		}
+
+		// 如果 nr < limit，说明 bufio 缓存暂时读完了，下一轮循环会从新 pLen 继续
 	}
 	return nil
 }
 
-// ReadFrom 尽可能多地从 bufio 缓冲区读取数据
+// ReadBuffered 尽可能多地从 bufio 缓冲区读取数据
 // 即使数据跨越了多个物理 Chunk (4KB)，也能通过循环一次性读完
-func (b *Buffer) ReadFrom(rd *bufio.Reader) (int64, error) {
-	// 1. 优先处理 Pipeline 积压（高性能路径）
+func (b *Buffer) ReadBuffered(rd *bufio.Reader) (int64, error) {
+	// 1. 极速路径：优先排空当前已有的 Pipeline 积压数据
 	n := rd.Buffered()
 	if n > 0 {
+		// 调用 ReadFull 搬运当前缓冲区内的全部数据
 		err := b.ReadFull(rd, n)
 		return int64(n), err
 	}
+	// 2. 缓冲区为空，进入 Slow Path 触发物理读取并循环收割
+	return b.readBufferedSlow(rd)
+}
 
-	// 2. 缓冲区为空，执行“对齐填充当前页”策略
-	physLen := b.length + b.firstPageOffset
-	prefix := 0
-	if b.hasSmall {
-		prefix = SmallChunkSize
-	}
+//go:noinline
+func (b *Buffer) readBufferedSlow(rd *bufio.Reader) (int64, error) {
+	var total int64
+	for {
+		// 1. 确保物理空间（至少 1 字节触发扩容或分配）
+		b.ensureCapacity(1)
 
-	var dest []byte
-	// 判定当前写在 SmallChunk 还是 BigChunk
-	if b.hasSmall && physLen < SmallChunkSize {
-		if b.small == nil {
-			b.ensureCapacity(1)
-		} // 兜底初始化
-		dest = b.small[physLen:SmallChunkSize]
-	} else {
-		bigPos := physLen - prefix
-		pageIdx := bigPos >> bigShift
-		innerOff := bigPos & bigMask
+		// 2. 定位当前物理写入点
+		pLen := b.length + b.firstPageOffset
+		var dest []byte
+		var limit int
 
-		// 关键优化：检查当前页是否已满
-		if innerOff == 0 && (len(b.big) <= pageIdx) {
-			// 当前页正好用完，或者还没分配，触发申请一个新 BigChunk
-			b.ensureCapacity(1)
-		} else if innerOff == 0 && pageIdx < len(b.big) {
-			// 已经在页首，无需申请
-		} else if innerOff > 0 && innerOff >= ChunkSize {
-			// 极端边界：手动进位并申请
-			b.ensureCapacity(1)
-			pageIdx = (b.length + b.firstPageOffset - prefix) >> bigShift
-			innerOff = 0
+		if b.hasSmall && pLen < SmallChunkSize {
+			// 在 SmallChunk 区域
+			if b.small == nil {
+				b.small = getSmallChunk()
+			}
+			limit = SmallChunkSize - pLen
+			dest = b.small[pLen:SmallChunkSize]
+		} else {
+			// 在 BigChunk 区域
+			prefix := 0
+			if b.hasSmall {
+				prefix = SmallChunkSize
+			}
+			bigPos := pLen - prefix
+			pageIdx := bigPos >> bigShift
+			innerOff := bigPos & bigMask
+
+			// 如果当前页已满，跳转到下一页
+			if innerOff >= ChunkSize {
+				pageIdx++
+				innerOff = 0
+			}
+			limit = ChunkSize - innerOff
+			dest = b.big[pageIdx][innerOff:ChunkSize]
 		}
 
-		// 获取当前页剩余的连续空间
-		dest = b.big[pageIdx][innerOff:ChunkSize]
-	}
+		// 3. 执行读取决策
+		buffered := rd.Buffered()
+		if buffered > 0 {
+			// 缓冲区有数据（来自上一轮物理 Read 的预读），执行“收割”
+			if limit > buffered {
+				limit = buffered
+			}
+			// 这里的 Read 实际上是内存拷贝 (memmove)
+			nr, _ := rd.Read(dest[:limit])
+			if nr > 0 {
+				b.length += nr
+				total += int64(nr)
+			}
+		} else {
+			// 缓冲区完全为空（首轮循环或已排空），执行物理 Read 触发 fill
+			nr, err := rd.Read(dest)
+			if nr > 0 {
+				b.length += nr
+				total += int64(nr)
+			}
+			if err != nil {
+				return total, err
+			}
+		}
 
-	// 3. 发起单次对齐 Read
-	nr, err := rd.Read(dest)
-	if nr > 0 {
-		b.Advance(nr)
+		// 4. 结束判定：如果 bufio 缓冲区已排空且没有更多预读数据，则退出
+		if rd.Buffered() == 0 {
+			break
+		}
+		// 否则继续循环，下一轮会进入“收割”逻辑或跨越物理页边界
 	}
-	return int64(nr), err
+	return total, nil
 }
 
 func (b *Buffer) WriteTo(wr io.Writer) (int64, error) {
@@ -977,9 +1061,11 @@ func (v BufferView) IsEmpty() bool {
 
 //go:inline At 支持随机访问，返回逻辑索引 index 处的字节
 func (v BufferView) At(index int) byte {
-	if index < 0 || index >= v.length {
-		panic("view index out of range")
+	// 1. 极简边界检查：利用 uint 一次性判定 index < 0 || index >= v.length
+	if uint(index) >= uint(v.length) {
+		panic("Buffer: slice index out of range")
 	}
+	// 2. 调用物理索引函数（确保 atByte 也是内联的）
 	return atByte(v.hasSmall, v.small, v.big, v.firstPageOffset, index)
 }
 
@@ -995,8 +1081,10 @@ func (v BufferView) Bytes() []byte {
 
 //go:inline Slice 在当前视图基础上再次切片 v[n:m]
 func (v BufferView) Slice(n, m int) BufferView {
-	if n < 0 || m < n || m > v.length {
-		panic(fmt.Errorf("view index out of range [%d:%d] with length %d", n, m, v.length))
+	// 1. 使用 uint 技巧一次性检查 n < 0, m < n, m > length
+	// 这与 Go 编译器处理切片的底层逻辑一致，节点数最少
+	if uint(n) > uint(m) || uint(m) > uint(v.length) {
+		panic("Buffer: slice index out of range")
 	}
 
 	length := m - n
@@ -1006,7 +1094,7 @@ func (v BufferView) Slice(n, m int) BufferView {
 
 //go:inline Tail 返回从 n 到末尾的视图，等价于 Go 切片 v[n:].
 func (v BufferView) Tail(n int) BufferView {
-	return v.Slice(n, v.Len())
+	return v.Slice(n, v.length)
 }
 
 func (b *Buffer) Reset() {

@@ -2,8 +2,6 @@ package redcon
 
 import (
 	"bufio"
-	"errors"
-	"fmt"
 	"io"
 	"time"
 )
@@ -108,65 +106,8 @@ func (r *Respond) Bytes() []byte {
 // ReadFrom 从 rd 中读取下一个完整的 RESP 报文。
 // 仅在 Buffer 为空时有效，解析结果填充 Buffer 并维护内部 RESP 结构。
 func (r *Respond) ReadFrom(rd *bufio.Reader) (int64, error) {
-	if r.Buffer.Len() > 0 {
-		return 0, errors.New("ReadFrom: buffer must be empty")
-	}
 	err := r.decodeStream(rd)
 	return int64(r.Buffer.Len()), err
-}
-
-// parseLen parses bulk string and array lengths.
-func fastParseLen(p BufferView) (int, error) {
-	if p.Len() == 0 {
-		return 0, errors.New("redis: ERR malformed integer")
-	}
-	raw := p.Bytes()
-
-	if raw[0] == '-' && len(raw) == 2 && raw[1] == '1' {
-		// handle $-1 and $-1 null replies.
-		return -1, nil
-	}
-
-	var n int
-	for _, b := range raw {
-		n *= 10
-		if b < '0' || b > '9' {
-			return -1, errors.New("redis: ERR illegal bytes in length")
-		}
-		n += int(b - '0')
-	}
-
-	return n, nil
-}
-
-// parseInt parses an integer reply.
-func fastParseInt(p BufferView) (int, error) {
-	if p.Len() == 0 {
-		return 0, errors.New("redis: ERR malformed integer")
-	}
-
-	var negate bool
-	var n int64
-
-	raw := p.Bytes()
-
-	if raw[0] == '-' {
-		negate = true
-		raw = raw[1:]
-	}
-
-	for _, b := range raw {
-		if b < '0' || b > '9' {
-			return 0, errors.New("redis: ERR illegal bytes in length")
-		}
-		n *= 10
-		n += int64(b - '0')
-	}
-
-	if negate {
-		n = -n
-	}
-	return int(n), nil
 }
 
 func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
@@ -223,7 +164,7 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 		return nil
 
 	default:
-		return fmt.Errorf("invalid resp type: %c", prefix)
+		return ErrInvalidRespType
 	}
 }
 
@@ -320,7 +261,7 @@ func (r *Respond) readRespLenSlow(rd *bufio.Reader, line []byte, err error) (int
 						if n == 1 && digitCount == 2 {
 							return -1, nil
 						}
-						return 0, errInvalidLength
+						return 0, ErrInvalidLength
 					}
 					return n, nil
 				}

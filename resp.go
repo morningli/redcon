@@ -1,7 +1,6 @@
 package redcon
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -39,7 +38,7 @@ func GetArrayLength(b *Buffer) (int, error) {
 			return strconv.Atoi(string(b.Slice(1, i-1).Bytes()))
 		}
 	}
-	return 0, errors.New("unexpected EOF")
+	return 0, ErrUnexpectedEOF
 }
 
 // RESP 表示一次解析后的 RESP 消息结构。
