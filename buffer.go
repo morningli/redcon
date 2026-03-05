@@ -11,7 +11,7 @@ const (
 	// SmallChunkSize 表示小页（第一页）的字节大小。
 	SmallChunkSize = 256
 	// bigShift 表示大页大小的 2 次幂指数：$2^{12}=4096$。
-	bigShift = 12
+	bigShift = 15
 	// ChunkSize 表示大页（Chunk）的字节大小。
 	ChunkSize = 1 << bigShift
 	// bigMask 用于等价替代 `% ChunkSize`。
