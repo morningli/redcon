@@ -2,6 +2,7 @@ package redcon
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"sync"
 )
@@ -1103,4 +1104,158 @@ func (b *Buffer) Reset() {
 	b.capacity = calculateCapacity(b.hasSmall, len(b.big))
 	// 不要清空 b.big，让已申请的 Chunk 留在切片里供下一轮 Reserve 直接使用
 	// 这样 Reserve(len) 内部就会直接返回 b.big[0][0:len]，实现真正的 0 分配
+}
+
+// indexByteGeneric 抽象了物理页扫描逻辑，专为内联优化设计
+func indexByteGeneric(hasSmall bool, small *SmallChunk, big []*Chunk, fpo, length int, c byte, start int) int {
+	// 1. 唯一边界检查
+	if uint(start) >= uint(length) {
+		return -1
+	}
+
+	pLen := fpo + start
+	var page []byte
+
+	// 2. Fast Path: 定位当前起始页 (内联友好)
+	if hasSmall && pLen < SmallChunkSize {
+		page = small[pLen:SmallChunkSize]
+	} else {
+		offset := pLen
+		if hasSmall {
+			offset -= SmallChunkSize
+		}
+		idx := offset >> bigShift
+		// 注意：调用方需保证 big 索引安全
+		page = big[idx][offset&bigMask : ChunkSize]
+	}
+
+	// 3. 计算本页可读长度
+	remaining := length - start
+	canRead := len(page)
+	if canRead > remaining {
+		canRead = remaining
+	}
+
+	// 4. 调用汇编优化的 IndexByte
+	res := bytes.IndexByte(page[:canRead], c)
+	if res >= 0 {
+		return start + res
+	}
+
+	// 5. 跨页处理：仅当数据未读完时进入 Slow Path (非内联)
+	if remaining > canRead {
+		return indexByteSlow(hasSmall, small, big, fpo, length, c, start+canRead)
+	}
+	return -1
+}
+
+func (b *Buffer) IndexByte(c byte, start int) int {
+	return indexByteGeneric(b.hasSmall, b.small, b.big, b.firstPageOffset, b.length, c, start)
+}
+
+func (v BufferView) IndexByte(c byte, start int) int {
+	return indexByteGeneric(v.hasSmall, v.small, v.big, v.firstPageOffset, v.length, c, start)
+}
+
+//go:noinline
+func indexByteSlow(hasSmall bool, small *SmallChunk, big []*Chunk, fpo, length int, c byte, start int) int {
+	curr := start
+
+	// 1. 如果起点在 SmallChunk 且没找完，先处理 SmallChunk（防御性逻辑）
+	if hasSmall && (fpo+curr) < SmallChunkSize {
+		canRead := SmallChunkSize - (fpo + curr)
+		remaining := length - curr
+		actual := canRead
+		if actual > remaining {
+			actual = remaining
+		}
+
+		idx := bytes.IndexByte(small[fpo+curr:fpo+curr+actual], c)
+		if idx >= 0 {
+			return curr + idx
+		}
+		curr += actual
+	}
+
+	// 2. 遍历后续所有 BigChunks
+	prefix := 0
+	if hasSmall {
+		prefix = SmallChunkSize
+	}
+
+	for curr < length {
+		// 计算物理坐标
+		bigPos := (fpo + curr) - prefix
+		pageIdx := bigPos >> bigShift
+		innerOff := bigPos & bigMask
+
+		// 安全检查：如果索引越界（逻辑错误），立即退出
+		if pageIdx >= len(big) {
+			break
+		}
+
+		page := big[pageIdx]
+		canRead := ChunkSize - innerOff
+		remaining := length - curr
+		actual := canRead
+		if actual > remaining {
+			actual = remaining
+		}
+
+		// 在当前 BigChunk 页面内进行汇编级扫描
+		idx := bytes.IndexByte(page[innerOff:innerOff+actual], c)
+		if idx >= 0 {
+			return curr + idx
+		}
+
+		// 步进到下一页
+		curr += actual
+	}
+
+	return -1
+}
+
+// parseIntGeneric 从物理坐标开始解析连续的数字。
+// 专为内联设计，不处理负号，负号由调用方通过 At(0) 判断。
+func parseIntGeneric(hasSmall bool, small *SmallChunk, big []*Chunk, fpo, length int) (int, bool) {
+	if length <= 0 {
+		return 0, false
+	}
+
+	n := 0
+	for i := 0; i < length; i++ {
+		// 直接内联 atByte 逻辑或使用 At() 的展开逻辑
+		physPos := fpo + i
+		var c byte
+		if hasSmall && physPos < SmallChunkSize {
+			c = small[physPos]
+		} else {
+			off := physPos
+			if hasSmall {
+				off -= SmallChunkSize
+			}
+			c = big[off>>bigShift][off&bigMask]
+		}
+
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
+}
+
+// BufferView 的成员函数 (内联)
+func (v BufferView) ParseInt() (int, bool) {
+	return parseIntGeneric(v.hasSmall, v.small, v.big, v.firstPageOffset, v.length)
+}
+
+// Buffer 的成员函数 (内联)
+func (b *Buffer) ParseInt(start, end int) (int, bool) {
+	// 简单边界检查
+	if uint(start) >= uint(end) || uint(end) > uint(b.length) {
+		return 0, false
+	}
+	// 传入物理偏移和目标段长度
+	return parseIntGeneric(b.hasSmall, b.small, b.big, b.firstPageOffset+start, end-start)
 }
