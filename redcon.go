@@ -2,7 +2,6 @@
 package redcon
 
 import (
-	"bufio"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -262,7 +261,6 @@ func serve(s *Server) error {
 		c := &conn{
 			conn: lnconn,
 			addr: lnconn.RemoteAddr().String(),
-			wr:   bufio.NewWriterSize(lnconn, 32<<10),
 			rd:   NewReader(lnconn),
 		}
 		s.mu.Lock()
@@ -277,8 +275,7 @@ func serve(s *Server) error {
 				s.mu.Unlock()
 				res := NewRespond()
 				res.WriteError(err.Error())
-				_, err = res.WriteTo(c.wr)
-				_ = c.wr.Flush()
+				_, err = res.WriteTo(c.conn)
 				res.Free()
 				_ = c.Close()
 				continue
@@ -332,8 +329,7 @@ func handle(s *Server, c *conn) {
 					// the client. Ignore write errors.
 					res := NewRespond()
 					res.WriteError("ERR " + err.Error())
-					_, _ = res.WriteTo(c.wr)
-					_ = c.wr.Flush()
+					_, _ = res.WriteTo(c.conn)
 					res.Free()
 				}
 				return err
@@ -357,13 +353,7 @@ func handle(s *Server, c *conn) {
 				res := NewRespond()
 				s.handler(c, cmd, res)
 				cmd.ProcessDoneTime = time.Now()
-				_, err = res.WriteTo(c.wr)
-				if err != nil {
-					cmd.Free()
-					res.Free()
-					return err
-				}
-				err = c.wr.Flush()
+				_, err = res.WriteTo(c.conn)
 				if err != nil {
 					cmd.Free()
 					res.Free()
@@ -391,7 +381,6 @@ func handle(s *Server, c *conn) {
 // conn represents a client connection
 type conn struct {
 	conn      net.Conn
-	wr        *bufio.Writer
 	rd        *Reader
 	addr      string
 	ctx       interface{}
