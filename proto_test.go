@@ -374,9 +374,9 @@ func TestDecodeStream_DeepArray(t *testing.T) {
 	// 構造一個嵌套 Array: *2\r\n$3\r\nGET\r\n*1\r\n$4\r\nINFO\r\n
 	data := []byte("*2\r\n$3\r\nGET\r\n*1\r\n$4\r\nINFO\r\n")
 	rd := bufio.NewReader(bytes.NewReader(data))
-	r := &Respond{Buffer: NewBuffer()}
+	r := NewRespond()
 
-	err := r.decodeStream(rd)
+	err := r.decodeStream(rd, nil)
 	if err != nil {
 		t.Fatalf("解析失敗: %v", err)
 	}
@@ -537,7 +537,7 @@ func BenchmarkRespond_DecodeStream(b *testing.B) {
 				rd.Reset(src)
 
 				// 3. 執行重構後的 FillStreaming 解析
-				err := r.decodeStream(rd)
+				err := r.decodeStream(rd, nil)
 				if err != nil {
 					b.Fatal(err)
 				}

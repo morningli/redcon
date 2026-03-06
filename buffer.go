@@ -967,6 +967,70 @@ func (b *Buffer) IndexByte(c byte, start int) int {
 	return indexByteGeneric(b.hasSmall, b.small, b.big, b.firstPageOffset, b.length, c, start)
 }
 
+// Truncate 将 Buffer 截断为前 n 字节。
+//
+//go:inline
+func (b *Buffer) Truncate(n int) {
+	if n >= b.length {
+		return
+	}
+	if n <= 0 {
+		b.Free()
+		//b.version++
+		return
+	}
+
+	b.length = n
+
+	// 物理截断点判定
+	splitPos := n + b.firstPageOffset
+	prefix := 0
+	if b.hasSmall {
+		prefix = SmallChunkSize
+	}
+
+	// 核心修正：只要当前有大页，就需要判断是否回收
+	if len(b.big) > 0 {
+		var keepCount int
+		if splitPos > prefix {
+			// 截断点在大页区域内
+			bigSplitPos := splitPos - prefix
+			keepCount = (bigSplitPos + bigMask) >> bigShift
+		} else {
+			// 截断点回到了 Small 页区域或更早，所有大页必须回收
+			keepCount = 0
+		}
+
+		// 只有当需要释放页或清空切片时才进慢路径
+		if keepCount < len(b.big) {
+			b.truncatePhysicalSlow(keepCount, prefix)
+		}
+	}
+	b.version++
+}
+
+//go:noinline
+func (b *Buffer) truncatePhysicalSlow(keepCount int, prefix int) {
+	// 1. 释放物理大页
+	for i := keepCount; i < len(b.big); i++ {
+		putBigChunk(b.big[i])
+	}
+
+	// 2. 更新状态
+	if keepCount == 0 {
+		b.big = nil
+		// 即使 b.small 为 nil，只要 hasSmall 为 true，逻辑容量就是 SmallChunkSize
+		if b.hasSmall {
+			b.capacity = SmallChunkSize
+		} else {
+			b.capacity = 0
+		}
+	} else {
+		b.big = b.big[:keepCount]
+		b.capacity = prefix + keepCount*ChunkSize
+	}
+}
+
 // BufferView 是对 IndexedBuffer 部分片段的只读视图。
 // 它通过引用原 Buffer 的页表并记录逻辑偏移来实现零拷贝操作。
 type BufferView struct {

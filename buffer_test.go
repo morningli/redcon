@@ -1146,3 +1146,131 @@ func TestShiftTo_Isolation(t *testing.T) {
 	// 6. 验证指針地址（進階）
 	// 如果底层是 []*Chunk，可以反射检查指針是否相同
 }
+
+func TestBuffer_Truncate(t *testing.T) {
+	// 假设常量定义（需根据你实际的 buffer.go 修改）
+	// const SmallChunkSize = 64
+	// const ChunkSize = 4096
+
+	t.Run("仅在 Small 页内截断", func(t *testing.T) {
+		b := NewBuffer()
+		data := make([]byte, 32) // 小于 SmallChunkSize
+		copy(data, "0123456789abcdef0123456789abcdef")
+		b.NewWriter().Write(data)
+
+		oldVersion := b.version
+		b.Truncate(10)
+
+		if b.Len() != 10 {
+			t.Errorf("长度错误: 期望 10, 得到 %d", b.Len())
+		}
+		if b.version != oldVersion+1 {
+			t.Error("版本号未增加")
+		}
+		if string(b.Bytes()) != "0123456789" {
+			t.Errorf("内容错误: %s", string(b.Bytes()))
+		}
+		if len(b.big) != 0 {
+			t.Error("不应存在大页")
+		}
+	})
+
+	t.Run("跨大页截断并回收物理页", func(t *testing.T) {
+		b := NewBuffer()
+		wr := b.NewWriter()
+
+		// 构造足以跨越 3 个大页的数据
+		// 数据量：SmallPage + 3 * ChunkSize
+		pageSize := 4096 // 假设 ChunkSize
+		total := 64 + pageSize*3
+		wr.Write(make([]byte, total))
+
+		if len(b.big) < 3 {
+			t.Fatalf("前置条件失败: 大页数量不足 %d", len(b.big))
+		}
+
+		// 截断到只剩第一个大页的一部分（保留 Small + 第一个大页的一半）
+		keepLen := 64 + pageSize/2
+		oldVersion := b.version
+		b.Truncate(keepLen)
+
+		if b.Len() != keepLen {
+			t.Errorf("长度错误: 期望 %d, 得到 %d", keepLen, b.Len())
+		}
+		if b.version != oldVersion+1 {
+			t.Error("版本号未增加")
+		}
+		// 物理页回收检查：应只剩 1 个大页
+		if len(b.big) != 1 {
+			t.Errorf("物理页回收失败: 期望 1 个大页, 得到 %d", len(b.big))
+		}
+	})
+
+	t.Run("完全释放大页回到 Small 状态", func(t *testing.T) {
+		b := NewBuffer()
+		wr := b.NewWriter()
+
+		// 1. 先写一小段数据（确保 hasSmall 保持为 true）
+		wr.Write([]byte("init-small"))
+		if !b.hasSmall {
+			t.Fatal("初始化后 hasSmall 应该为 true")
+		}
+
+		// 2. 追加大数据（触发大页分配，但 hasSmall 依然为 true）
+		// 构造足以跨越多个大页的数据
+		bigData := make([]byte, 8192)
+		wr.Write(bigData)
+
+		if len(b.big) == 0 {
+			t.Fatal("追加大数据后应该分配了大页")
+		}
+		if !b.hasSmall {
+			t.Fatal("追加写入不应改变 hasSmall 策略状态")
+		}
+
+		// 3. 截断到最初的小段数据长度（例如 10 字节）
+		b.Truncate(10)
+
+		// 4. 验证物理回收
+		if b.Len() != 10 {
+			t.Errorf("长度错误: 得到 %d", b.Len())
+		}
+		if len(b.big) != 0 {
+			t.Errorf("大页未完全释放: 仍有 %d 个大页", len(b.big))
+		}
+		if !b.hasSmall {
+			t.Error("应当保留 Small 策略标记")
+		}
+		if b.capacity != SmallChunkSize {
+			t.Errorf("容量不匹配: 期望 %d, 得到 %d", SmallChunkSize, b.capacity)
+		}
+	})
+
+	t.Run("幂等性测试（n >= length 不应修改）", func(t *testing.T) {
+		b := NewBuffer()
+		b.NewWriter().Write([]byte("hello"))
+
+		oldVersion := b.version
+		b.Truncate(5)  // 等于长度
+		b.Truncate(10) // 大于长度
+
+		if b.version != oldVersion {
+			t.Error("不应修改版本号")
+		}
+	})
+
+	t.Run("边界测试：截断到 0", func(t *testing.T) {
+		b := NewBuffer()
+		b.NewWriter().Write(make([]byte, 100))
+
+		b.Truncate(0)
+
+		if b.Len() != 0 {
+			t.Error("长度应为 0")
+		}
+		// 验证是否触发了 Free (物理页应全部清理)
+		if b.small != nil || b.big != nil {
+			t.Error("物理资源未完全释放")
+		}
+	})
+}

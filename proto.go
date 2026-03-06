@@ -108,59 +108,104 @@ func (r *Respond) Bytes() []byte {
 // ReadFrom 从 rd 中读取下一个完整的 RESP 报文。
 // 仅在 Buffer 为空时有效，解析结果填充 Buffer 并维护内部 RESP 结构。
 func (r *Respond) ReadFrom(rd *bufio.Reader) (int64, error) {
-	err := r.decodeStream(rd)
+	err := r.decodeStream(rd, nil)
 	return int64(r.Buffer.Len()), err
 }
 
-func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
-	wr := r.NewWriter()
-	// 1. 读取前缀
-	prefix, err := rd.ReadByte()
-	if err != nil {
+// decodeStream 从 rd 中读取并解析一个完整的 RESP 报文。
+// 如果存在 Pipeline 粘包数据且 newBuf 不为 nil，则通过 Split 将多余数据切分给 newBuf。
+func (r *Respond) decodeStream(rd *bufio.Reader, newBuf *Buffer) (err error) {
+	// 始终从 Buffer 的逻辑起点开始探测第一个完整报文
+	const startOff = 0
+
+	for {
+		// 1. 批量收割：将 bufio 中的存量数据灌入物理 Buffer
+		// 若 bufio 为空，则阻塞 rd.Read 触发物理网络 IO
+		if _, err = r.wr.CopyBufferedTo(rd); err != nil {
+			return err
+		}
+
+		// 2. 内存增量解析探测
+		// off 为局部变量，记录解析出的第一个 RESP 报文边界
+		off := startOff
+		err = r.decodeBufferedInline(&off)
+
+		// 3. 解析成功逻辑
+		if err == nil {
+			// off 现在指向第一个完整 RESP 报文的结束位置（\r\n 之后）
+
+			// 处理 Pipeline / 粘包
+			if off < r.Len() {
+				if newBuf != nil {
+					// 将多余数据切分到 newBuf 中，r.Buffer 只保留 [0, off)
+					r.Split(off, newBuf)
+				} else {
+					// 若未提供存储容器，则丢弃多出的部分，确保 r.Buffer 只含一个完整报文
+					r.Truncate(off)
+				}
+			}
+			return nil
+		}
+
+		// 4. 处理半包 (UnexpectedEOF)
+		if err == io.ErrUnexpectedEOF || err == io.EOF {
+			// 数据不足一个完整报文：继续循环收割
+			// 在 MB 级数据量下，这种基于 At(i) 的重扫比维护复杂状态机更高效
+			continue
+		}
+
+		// 真实的协议解析错误
 		return err
 	}
-	wr.WriteByte(prefix)
+}
+
+//go:inline
+func (r *Respond) decodeBufferedInline(off *int) error {
+	if *off >= r.Len() {
+		return io.ErrUnexpectedEOF
+	}
+
+	prefix := r.At(*off)
+	*off++
 
 	switch Type(prefix) {
 	case String, Error, Integer:
-		// 2. 读取到行尾，获取视图
-		_, err := r.CopyLenTo(rd, wr)
-		if err != nil {
-			return err
+		// 寻找 \r\n 终止符
+		start := *off
+		for i := start; i < r.Len()-1; i++ {
+			if r.At(i) == '\r' && r.At(i+1) == '\n' {
+				*off = i + 2
+				return nil
+			}
 		}
-		return nil
-	case Bulk:
-		// 1. 读取长度行视图
-		n, err := r.CopyLenTo(rd, wr)
-		if err != nil {
-			return err
-		}
+		return io.ErrUnexpectedEOF
 
+	case Bulk:
+		n, err := r.parseLenInline(off)
+		if err != nil {
+			return err
+		}
 		if n == -1 { // Null Bulk String "$-1\r\n"
 			return nil
 		}
-
-		// 2. 读取主体数据 n + 2 字节 (\r\n)
-		// 使用适配器流式灌入物理 Buffer
-		if err := wr.CopyN(rd, n+2); err != nil {
-			return err
+		// 检查 Bulk 内容 + \r\n 是否完整
+		if *off+n+2 > r.Len() {
+			return io.ErrUnexpectedEOF
 		}
+		*off += n + 2
 		return nil
+
 	case Array:
-		// 1. 读取数量行视图
-		count, err := r.CopyLenTo(rd, wr)
+		count, err := r.parseLenInline(off)
 		if err != nil {
 			return err
 		}
-
 		if count <= 0 { // *0\r\n 或 *-1\r\n
 			return nil
 		}
-
-		// 2. 递归读取子元素
+		// 递归解析子元素
 		for i := 0; i < count; i++ {
-			err := r.decodeStream(rd)
-			if err != nil {
+			if err := r.decodeBufferedInline(off); err != nil {
 				return err
 			}
 		}
@@ -169,6 +214,50 @@ func (r *Respond) decodeStream(rd *bufio.Reader) (err error) {
 	default:
 		return ErrInvalidRespType
 	}
+}
+
+//go:inline
+func (r *Respond) parseLenInline(off *int) (int, error) {
+	start := *off
+	// 快速内存扫描寻找行尾
+	end := -1
+	for i := start; i < r.Len()-1; i++ {
+		if r.At(i) == '\r' && r.At(i+1) == '\n' {
+			end = i
+			break
+		}
+	}
+	if end == -1 {
+		return 0, io.ErrUnexpectedEOF
+	}
+
+	// 原地内存解析整数，无内存分配
+	val := 0
+	isNeg := false
+	curr := start
+	if r.At(curr) == '-' {
+		isNeg = true
+		curr++
+	}
+
+	for i := curr; i < end; i++ {
+		b := r.At(i)
+		if b < '0' || b > '9' {
+			return 0, ErrInvalidLength
+		}
+		val = val*10 + int(b-'0')
+	}
+
+	if isNeg {
+		if val == 1 { // 处理 -1
+			*off = end + 2
+			return -1, nil
+		}
+		return 0, ErrInvalidLength
+	}
+
+	*off = end + 2
+	return val, nil
 }
 
 // CopyLineTo 从 rd 读取一行（直到 \r\n）并直接拷贝到写入器 w 中。
