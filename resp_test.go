@@ -2,58 +2,67 @@ package redcon
 
 import (
 	"bytes"
-	"github.com/stretchr/testify/require"
 	"testing"
 )
 
 func TestAppendBulkFloat(t *testing.T) {
-	var b = NewBuffer()
+	var buf = NewBuffer()
+	b := buf.NewWriter()
+
 	AppendString(b, "HELLO")
 	AppendBulkFloat(b, 9.123192839)
 	AppendString(b, "HELLO")
 	exp := "+HELLO\r\n$11\r\n9.123192839\r\n+HELLO\r\n"
-	if string(b.Bytes()) != exp {
-		t.Fatalf("expected '%s', got '%s'", exp, b.Bytes())
+	if string(buf.Bytes()) != exp {
+		t.Fatalf("expected '%s', got '%s'", exp, buf.Bytes())
 	}
 }
 
 func TestAppendBulkInt(t *testing.T) {
-	var b = NewBuffer()
+	var buf = NewBuffer()
+	b := buf.NewWriter()
+
 	AppendString(b, "HELLO")
 	AppendBulkInt(b, -9182739137)
 	AppendString(b, "HELLO")
 	exp := "+HELLO\r\n$11\r\n-9182739137\r\n+HELLO\r\n"
-	if string(b.Bytes()) != exp {
-		t.Fatalf("expected '%s', got '%s'", exp, b.Bytes())
+	if string(buf.Bytes()) != exp {
+		t.Fatalf("expected '%s', got '%s'", exp, buf.Bytes())
 	}
 }
 
 func TestAppendBulkUint(t *testing.T) {
-	var b = NewBuffer()
+	var buf = NewBuffer()
+	b := buf.NewWriter()
+
 	AppendString(b, "HELLO")
 	AppendBulkInt(b, 91827391370)
 	AppendString(b, "HELLO")
 	exp := "+HELLO\r\n$11\r\n91827391370\r\n+HELLO\r\n"
-	if string(b.Bytes()) != exp {
-		t.Fatalf("expected '%s', got '%s'", exp, b.Bytes())
+	if string(buf.Bytes()) != exp {
+		t.Fatalf("expected '%s', got '%s'", exp, buf.Bytes())
 	}
 }
 
 func TestAppendArray(t *testing.T) {
-	var b = NewBuffer()
+	var buf = NewBuffer()
+	b := buf.NewWriter()
+
 	AppendArray(b, 1)
 	AppendBulk(b, []byte("HELLO"))
 	exp := "*1\r\n$5\r\nHELLO\r\n"
-	if string(b.Bytes()) != exp {
-		t.Fatalf("expected '%s', got '%s'", exp, b.Bytes())
+	if string(buf.Bytes()) != exp {
+		t.Fatalf("expected '%s', got '%s'", exp, buf.Bytes())
 	}
 }
 
 func TestAppendNullArray(t *testing.T) {
-	b := NewBuffer()
+	var buf = NewBuffer()
+	b := buf.NewWriter()
+
 	AppendNullArray(b)
-	if string(b.Bytes()) != "*-1\r\n" {
-		t.Fatalf("expected %q, got %q", "*-1\r\n", string(b.Bytes()))
+	if string(buf.Bytes()) != "*-1\r\n" {
+		t.Fatalf("expected %q, got %q", "*-1\r\n", string(buf.Bytes()))
 	}
 }
 
@@ -80,7 +89,8 @@ func TestReadNextRESP_AllTypesAndStructures(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := NewBuffer()
-			_, _ = b.Write([]byte(tt.raw))
+			wr := b.NewWriter()
+			_, _ = wr.Write([]byte(tt.raw))
 			view := b.Slice(0, b.Len())
 
 			n, resp := ReadNextRESP(view)
@@ -115,9 +125,11 @@ func TestReadNextRESP_AllTypesAndStructures(t *testing.T) {
 func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 	t.Run("array_empty", func(t *testing.T) {
 		raw := "*0\r\n"
-		b := NewBuffer()
+		var buf = NewBuffer()
+		b := buf.NewWriter()
+
 		_, _ = b.Write([]byte(raw))
-		view := b.Slice(0, b.Len())
+		view := buf.Slice(0, buf.Len())
 
 		n, resp := ReadNextRESP(view)
 		if n != view.Len() {
@@ -139,9 +151,11 @@ func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 
 	t.Run("array_null", func(t *testing.T) {
 		raw := "*-1\r\n"
-		b := NewBuffer()
+		var buf = NewBuffer()
+		b := buf.NewWriter()
+
 		_, _ = b.Write([]byte(raw))
-		view := b.Slice(0, b.Len())
+		view := buf.Slice(0, buf.Len())
 
 		n, resp := ReadNextRESP(view)
 		if n != view.Len() {
@@ -163,9 +177,11 @@ func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 
 	t.Run("array_mixed_nested", func(t *testing.T) {
 		raw := "*4\r\n+OK\r\n:1\r\n$3\r\nbar\r\n*2\r\n:2\r\n$3\r\nbaz\r\n"
-		b := NewBuffer()
+		var buf = NewBuffer()
+		b := buf.NewWriter()
+
 		_, _ = b.Write([]byte(raw))
-		view := b.Slice(0, b.Len())
+		view := buf.Slice(0, buf.Len())
 
 		n, resp := ReadNextRESP(view)
 		if n != view.Len() {
@@ -200,9 +216,11 @@ func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 
 func TestRESP_MapAndMapGet(t *testing.T) {
 	raw := "*4\r\n$3\r\nfoo\r\n$3\r\nbar\r\n$3\r\nbaz\r\n$3\r\nqux\r\n"
-	b := NewBuffer()
+	var buf = NewBuffer()
+	b := buf.NewWriter()
+
 	_, _ = b.Write([]byte(raw))
-	view := b.Slice(0, b.Len())
+	view := buf.Slice(0, buf.Len())
 
 	_, resp := ReadNextRESP(view)
 	if resp.Type != Array || resp.Count != 4 {
@@ -228,46 +246,12 @@ func TestRESP_MapAndMapGet(t *testing.T) {
 	}
 }
 
-func TestGetArrayLength(t *testing.T) {
-	t.Run("non_array_returns_1", func(t *testing.T) {
-		b := NewBuffer()
-		_, _ = b.Write([]byte("+OK\r\n"))
-		n, err := GetArrayLength(b)
-		if err != nil {
-			t.Fatalf("unexpected err: %v", err)
-		}
-		if n != 1 {
-			t.Fatalf("expected 1, got %d", n)
-		}
-	})
-
-	t.Run("array_returns_count", func(t *testing.T) {
-		b := NewBuffer()
-		_, _ = b.Write([]byte("*2\r\n$1\r\na\r\n$1\r\nb\r\n"))
-		n, err := GetArrayLength(b)
-		if err != nil {
-			t.Fatalf("unexpected err: %v", err)
-		}
-		if n != 2 {
-			t.Fatalf("expected 2, got %d", n)
-		}
-	})
-
-	t.Run("array_incomplete_returns_error", func(t *testing.T) {
-		b := NewBuffer()
-		_, _ = b.Write([]byte("*2\r")) // missing LF
-		_, err := GetArrayLength(b)
-		if err == nil {
-			t.Fatalf("expected error, got nil")
-		}
-	})
-}
-
 func TestReadNextRESP_ConsumesOnlyOneMessage(t *testing.T) {
 	raw := "+OK\r\n:1\r\n"
-	b := NewBuffer()
+	var buf = NewBuffer()
+	b := buf.NewWriter()
 	_, _ = b.Write([]byte(raw))
-	view := b.Slice(0, b.Len())
+	view := buf.Slice(0, buf.Len())
 
 	n, resp := ReadNextRESP(view)
 	if resp.Type != String || resp.String() != "OK" {
@@ -288,7 +272,8 @@ func TestReadNextRESP_WithBytesBufferView(t *testing.T) {
 	raw := "$5\r\nHELLO\r\n"
 	buf := bytes.NewBufferString(raw)
 	b := NewBuffer()
-	_, _ = b.Write(buf.Bytes())
+	wr := b.NewWriter()
+	_, _ = wr.Write(buf.Bytes())
 	view := b.Slice(0, b.Len())
 	_, resp := ReadNextRESP(view)
 	if resp.Type != Bulk || resp.String() != "HELLO" {
@@ -298,7 +283,8 @@ func TestReadNextRESP_WithBytesBufferView(t *testing.T) {
 
 func TestReadNextRESP_SimpleString_Structure(t *testing.T) {
 	b := NewBuffer()
-	_, _ = b.Write([]byte("+OK\r\n"))
+	wr := b.NewWriter()
+	_, _ = wr.Write([]byte("+OK\r\n"))
 	view := b.Slice(0, b.Len())
 
 	n, resp := ReadNextRESP(view)
@@ -324,7 +310,8 @@ func TestReadNextRESP_SimpleString_Structure(t *testing.T) {
 
 func TestReadNextRESP_Bulk_Structure(t *testing.T) {
 	b := NewBuffer()
-	_, _ = b.Write([]byte("$3\r\nfoo\r\n"))
+	wr := b.NewWriter()
+	_, _ = wr.Write([]byte("$3\r\nfoo\r\n"))
 	view := b.Slice(0, b.Len())
 
 	n, resp := ReadNextRESP(view)
@@ -345,7 +332,8 @@ func TestReadNextRESP_Bulk_Structure(t *testing.T) {
 func TestReadNextRESP_ArrayNested_Structure(t *testing.T) {
 	raw := "*2\r\n*2\r\n:1\r\n:2\r\n$3\r\nbar\r\n"
 	b := NewBuffer()
-	_, _ = b.Write([]byte(raw))
+	wr := b.NewWriter()
+	_, _ = wr.Write([]byte(raw))
 	view := b.Slice(0, b.Len())
 
 	n, resp := ReadNextRESP(view)
@@ -380,53 +368,4 @@ func TestReadNextRESP_ArrayNested_Structure(t *testing.T) {
 	if last.Type != Bulk || last.String() != "bar" {
 		t.Fatalf("expected last=$bar, got Type=%v String=%q", last.Type, last.String())
 	}
-}
-
-func TestGetType(t *testing.T) {
-	t.Run("empty", func(t *testing.T) {
-		b := NewBuffer()
-		ty := GetType(b)
-		require.Zero(t, ty)
-		b.Free()
-	})
-
-	t.Run("String", func(t *testing.T) {
-		b := NewBuffer()
-		AppendString(b, "foo")
-		ty := GetType(b)
-		require.Equal(t, String, ty)
-		b.Free()
-	})
-
-	t.Run("Bulk", func(t *testing.T) {
-		b := NewBuffer()
-		AppendBulk(b, []byte("foo"))
-		ty := GetType(b)
-		require.Equal(t, Bulk, ty)
-		b.Free()
-	})
-
-	t.Run("Error", func(t *testing.T) {
-		b := NewBuffer()
-		AppendError(b, "foo")
-		ty := GetType(b)
-		require.Equal(t, Error, ty)
-		b.Free()
-	})
-
-	t.Run("Array", func(t *testing.T) {
-		b := NewBuffer()
-		AppendNullArray(b)
-		ty := GetType(b)
-		require.Equal(t, Array, ty)
-		b.Free()
-	})
-
-	t.Run("Integer", func(t *testing.T) {
-		b := NewBuffer()
-		AppendInt(b, 1)
-		ty := GetType(b)
-		require.Equal(t, Integer, ty)
-		b.Free()
-	})
 }

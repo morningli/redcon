@@ -78,10 +78,11 @@ func TestReadUntilCRLF(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := NewRespond()
+			wr := r.NewWriter()
 			// 使用自定义大小的 Reader 模拟边界
 			reader := bufio.NewReaderSize(strings.NewReader(tt.input), tt.bufSize)
 
-			got, err := r.readUntilCRLF(reader)
+			got, err := r.CopyLineTo(reader, wr)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -431,9 +432,10 @@ func TestReadUntilCRLF_Boundary(t *testing.T) {
 	data := []byte("FIRST\r\n")
 	rd := bufio.NewReaderSize(bytes.NewReader(data), 6) // 故意设小缓冲区
 
-	r := &Respond{Buffer: NewBuffer()}
+	r := NewRespond()
+	wr := r.NewWriter()
 
-	view, err := r.readUntilCRLF(rd)
+	view, err := r.CopyLineTo(rd, wr)
 	if err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
@@ -492,12 +494,13 @@ func runBenchmarkReadUntil(b *testing.B, data []byte) {
 		// 3. 【关键】复用 Buffer
 		// 确保你的 Buffer.Reset() 只是将 length 设为 0，而不释放已有的 BigChunks
 		r.Buffer.Reset()
+		wr := r.NewWriter()
 
 		// 4. 重置数据源和 Reader 指针
 		readerSource.Reset(data)
 		rd.Reset(readerSource)
 
-		_, err := r.readUntilCRLF(rd)
+		_, err := r.CopyLineTo(rd, wr)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -519,7 +522,7 @@ func BenchmarkRespond_DecodeStream(b *testing.B) {
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
 			// 1. 初始化環境，確保對象複用 (0 Alloc)
-			r := &Respond{Buffer: NewBuffer()}
+			r := NewRespond()
 			rd := bufio.NewReaderSize(nil, 16384)
 			src := bytes.NewReader(tc.data)
 
@@ -529,6 +532,7 @@ func BenchmarkRespond_DecodeStream(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				// 2. 重置狀態，不重新分配物理 Chunk
 				r.Buffer.Reset()
+				r.wr.Sync()
 				src.Reset(tc.data)
 				rd.Reset(src)
 
@@ -540,4 +544,101 @@ func BenchmarkRespond_DecodeStream(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestRespond_TryGetArraySize(t *testing.T) {
+	t.Run("non_array_returns_1", func(t *testing.T) {
+		var r = NewRespond()
+		defer r.Free()
+		r.WriteRaw([]byte("+OK\r\n"))
+		n, err := r.TryGetArraySize()
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("expected 1, got %d", n)
+		}
+	})
+
+	t.Run("array_returns_count", func(t *testing.T) {
+		var r = NewRespond()
+		defer r.Free()
+		r.WriteRaw([]byte("*2\r\n$1\r\na\r\n$1\r\nb\r\n"))
+		n, err := r.TryGetArraySize()
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if n != 2 {
+			t.Fatalf("expected 2, got %d", n)
+		}
+	})
+
+	t.Run("array_incomplete_returns_error", func(t *testing.T) {
+		var r = NewRespond()
+		defer r.Free()
+		r.WriteRaw([]byte("*2\r")) // missing LF
+		_, err := r.TryGetArraySize()
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+	})
+}
+
+func TestRespond_Type2(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		b := NewRespond()
+		ty := b.Type()
+		require.Zero(t, ty)
+		b.Free()
+	})
+
+	t.Run("String", func(t *testing.T) {
+		b := NewRespond()
+		b.WriteString("foo")
+		ty := b.Type()
+		require.Equal(t, String, ty)
+		b.Free()
+	})
+
+	t.Run("Bulk", func(t *testing.T) {
+		b := NewRespond()
+		b.WriteBulk([]byte("foo"))
+		ty := b.Type()
+		require.Equal(t, Bulk, ty)
+		b.Free()
+	})
+
+	t.Run("Error", func(t *testing.T) {
+		b := NewRespond()
+		b.WriteError("foo")
+		ty := b.Type()
+		require.Equal(t, Error, ty)
+		b.Free()
+	})
+
+	t.Run("Array", func(t *testing.T) {
+		b := NewRespond()
+		b.WriteArray(-1)
+		ty := b.Type()
+		require.Equal(t, Array, ty)
+		b.Free()
+	})
+
+	t.Run("Integer", func(t *testing.T) {
+		b := NewRespond()
+		b.WriteInt(1)
+		ty := b.Type()
+		require.Equal(t, Integer, ty)
+		b.Free()
+	})
+}
+
+func TestRequest_WriteArray(t *testing.T) {
+	r := NewRequest()
+	defer r.Free()
+	r.WriteArray(1)
+	r.WriteBulk([]byte("ping"))
+	require.Equal(t, []byte("*1\r\n$4\r\nping\r\n"), r.Raw.Bytes())
+	require.Equal(t, 1, len(r.Args))
+	require.Equal(t, []byte("ping"), r.Args[0].Bytes())
 }

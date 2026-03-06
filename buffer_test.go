@@ -14,9 +14,11 @@ import (
 
 func TestBuffer_Swap(t *testing.T) {
 	buf := NewBuffer()
-	buf.Write([]byte("hello"))
+	wr := buf.NewWriter()
+	wr.Write([]byte("hello"))
 	buf2 := NewBuffer()
-	buf2.Write([]byte("world"))
+	wr2 := buf2.NewWriter()
+	wr2.Write([]byte("world"))
 	buf.Swap(buf2)
 	require.Equal(t, []byte("hello"), buf2.Bytes())
 	require.Equal(t, []byte("world"), buf.Bytes())
@@ -24,7 +26,8 @@ func TestBuffer_Swap(t *testing.T) {
 
 func TestBuffer_Tail(t *testing.T) {
 	buf := NewBuffer()
-	buf.Write([]byte("hello world"))
+	wr := buf.NewWriter()
+	wr.Write([]byte("hello world"))
 
 	v := buf.Tail(6)
 	require.Equal(t, []byte("world"), v.Bytes())
@@ -35,13 +38,14 @@ func TestBuffer_Tail(t *testing.T) {
 
 func TestBuffer_UpgradeFromSmallToBig(t *testing.T) {
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 	// 触发“大页追加”：写入超过 SmallChunkSize（第一页为小页，后续为大页）
 	payload := make([]byte, SmallChunkSize+10)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	_, _ = buf.Write(payload[:SmallChunkSize])
-	_, _ = buf.Write(payload[SmallChunkSize:])
+	_, _ = wr.Write(payload[:SmallChunkSize])
+	_, _ = wr.Write(payload[SmallChunkSize:])
 	require.True(t, buf.hasSmall)
 
 	// 随机访问与切片必须正确
@@ -66,12 +70,13 @@ func TestBuffer_UpgradeFromSmallToBig(t *testing.T) {
 func TestBuffer_Split_RemainderSuffixFitsSmall(t *testing.T) {
 	// Build: small + one big page, but only use 10 bytes into the big page.
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 	payload := make([]byte, SmallChunkSize+10)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	_, _ = buf.Write(payload[:SmallChunkSize])
-	_, _ = buf.Write(payload[SmallChunkSize:])
+	_, _ = wr.Write(payload[:SmallChunkSize])
+	_, _ = wr.Write(payload[SmallChunkSize:])
 	require.True(t, buf.hasSmall)
 
 	// Split inside the big page so that remainder's first fragment is <=128.
@@ -94,11 +99,12 @@ func TestBuffer_Split_RemainderSuffixFitsSmall(t *testing.T) {
 
 func TestBuffer_FirstWriteLarge_UsesBigFirstPage(t *testing.T) {
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 	payload := make([]byte, SmallChunkSize+1)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	_, _ = buf.Write(payload)
+	_, _ = wr.Write(payload)
 
 	require.False(t, buf.hasSmall)
 	require.Nil(t, buf.small)
@@ -112,11 +118,12 @@ func TestBuffer_FirstWriteLarge_UsesBigFirstPage(t *testing.T) {
 
 func TestBuffer_FirstWriteSmall_UsesSmallFirstPage(t *testing.T) {
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 	payload := make([]byte, SmallChunkSize-1)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	_, _ = buf.Write(payload)
+	_, _ = wr.Write(payload)
 
 	require.True(t, buf.hasSmall)
 	require.NotNil(t, buf.small)
@@ -129,12 +136,13 @@ func TestBuffer_FirstWriteSmall_UsesSmallFirstPage(t *testing.T) {
 func TestBuffer_Split_DoesNotShareBoundaryPageAndKeepsOldViews(t *testing.T) {
 	// Build: small + one big page + some.
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 	payload := make([]byte, SmallChunkSize+ChunkSize+20)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	_, _ = buf.Write(payload[:SmallChunkSize])
-	_, _ = buf.Write(payload[SmallChunkSize:])
+	_, _ = wr.Write(payload[:SmallChunkSize])
+	_, _ = wr.Write(payload[SmallChunkSize:])
 	require.True(t, buf.hasSmall)
 	require.GreaterOrEqual(t, len(buf.big), 1)
 	boundaryPage := buf.big[0]
@@ -172,11 +180,12 @@ func TestBuffer_Split_DoesNotShareBoundaryPageAndKeepsOldViews(t *testing.T) {
 func TestBuffer_Split_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
 	// First write > SmallChunkSize => big-only buffer.
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 	payload := make([]byte, ChunkSize+100)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	_, _ = buf.Write(payload)
+	_, _ = wr.Write(payload)
 	require.False(t, buf.hasSmall)
 	require.GreaterOrEqual(t, len(buf.big), 1)
 
@@ -195,11 +204,12 @@ func TestBuffer_Split_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
 func TestBuffer_Split_BigOnly_RemainderSuffixNeedsBig(t *testing.T) {
 	// big-only buffer.
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 	payload := make([]byte, ChunkSize+100)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	_, _ = buf.Write(payload)
+	_, _ = wr.Write(payload)
 	require.False(t, buf.hasSmall)
 	require.GreaterOrEqual(t, len(buf.big), 1)
 	boundary := buf.big[0]
@@ -402,9 +412,10 @@ func TestBuffer_ReadFrom(t *testing.T) {
 	// 3. 初始化你的内存池 Buffer
 	// 假设 NewBuffer 是你的构造函数
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 
 	// 4. 执行测试逻辑
-	n, err := buf.ReadBuffered(brd)
+	n, err := wr.CopyBufferedTo(brd)
 	if err != nil && err != io.EOF {
 		t.Fatalf("ReadFromBuffered 执行失败: %v", err)
 	}
@@ -418,7 +429,9 @@ func TestBuffer_ReadFrom(t *testing.T) {
 // 可选：增加一个边界测试，验证当 Buffer 已有部分数据且 offset 不在页首时的情况
 func TestBuffer_ReadFrom_WithOffset(t *testing.T) {
 	buf := NewBuffer()
-	buf.Write([]byte("hello world")) // 11
+	wr := buf.NewWriter()
+
+	wr.Write([]byte("hello world")) // 11
 
 	extraData := bytes.Repeat([]byte("a"), 5000)
 
@@ -430,7 +443,7 @@ func TestBuffer_ReadFrom_WithOffset(t *testing.T) {
 
 	t.Logf("Before: Buffered = %d", brd.Buffered()) // 这里应该打印 5000
 
-	n, err := buf.ReadBuffered(brd)
+	n, err := wr.CopyBufferedTo(brd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +458,8 @@ func TestBuffer_ReadFrom_WithOffset(t *testing.T) {
 func TestBuffer_ReadFrom_WithOffset2(t *testing.T) {
 	init := []byte("hello world")
 	buf := NewBuffer()
-	buf.Write(init) // 11
+	wr := buf.NewWriter()
+	wr.Write(init) // 11
 
 	extraData := bytes.Repeat([]byte("a"), 5000)
 
@@ -454,7 +468,7 @@ func TestBuffer_ReadFrom_WithOffset2(t *testing.T) {
 
 	t.Logf("Before: Buffered = %d", brd.Buffered()) // 这里应该打印 5000
 
-	n, err := buf.ReadBuffered(brd)
+	n, err := wr.CopyBufferedTo(brd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,14 +491,16 @@ func TestBuffer_ReadFull_MultiPage(t *testing.T) {
 	// 2. 初始化 Buffer 并制造一个起始偏移量 (例如 11 字节)
 	// 这样可以测试物理页不是从 0 开始填充的情况
 	buf := NewBuffer()
+	wr := buf.NewWriter()
+
 	prefix := []byte("head_offset") // 11 字节
-	buf.Write(prefix)
+	wr.Write(prefix)
 
 	// 3. 构造 bufio.Reader
 	brd := bufio.NewReaderSize(bytes.NewReader(testData), 16*1024)
 
 	// 4. 执行 ReadFull
-	err := buf.ReadFull(brd, dataSize)
+	err := wr.CopyN(brd, dataSize)
 	if err != nil {
 		t.Fatalf("ReadFull 失败: %v", err)
 	}
@@ -517,10 +533,11 @@ func TestBuffer_ReadFull_MultiPage(t *testing.T) {
 
 func TestBuffer_WriteTo(t *testing.T) {
 	buf := NewBuffer()
+	wr_ := buf.NewWriter()
 
 	// 1. 强制检查写入过程
 	input := []byte("hello world")
-	_, err := buf.Write(input)
+	_, err := wr_.Write(input)
 	require.NoError(t, err)
 
 	// 2. 检查内部状态（调试打印）
@@ -539,10 +556,11 @@ func TestBuffer_WriteTo(t *testing.T) {
 
 func TestBuffer_ReadFrom2(t *testing.T) {
 	buf := NewBuffer()
+	wr := buf.NewWriter()
 
 	input := []byte("hello world")
 	rd := bufio.NewReaderSize(bytes.NewReader(input), 1024)
-	n, err := buf.ReadBuffered(rd)
+	n, err := wr.CopyBufferedTo(rd)
 	require.NoError(t, err)
 	require.Equal(t, input, buf.Bytes())
 	require.Equal(t, int64(len(input)), int64(n))
@@ -551,11 +569,12 @@ func TestBuffer_ReadFrom2(t *testing.T) {
 func TestBuffer_WriteTo_Complex(t *testing.T) {
 	// 1. 初始化 Buffer，构造跨越 SmallChunk 和多个 BigChunk 的数据
 	buf := NewBuffer() // 假设初始 hasSmall 为 true
+	wr := buf.NewWriter()
 
 	// 写入一些数据制造偏移。例如先写 10 字节。
 	// 这会使得 firstPageOffset = 0, length = 10 (在 SmallChunk 中)
 	initialData := []byte("0123456789")
-	buf.Write(initialData)
+	wr.Write(initialData)
 
 	// 此时模拟从中间开始写，人为调整 firstPageOffset (模拟之前的 Read 操作留下的偏移)
 	// 比如我们只关心从第 5 个字节开始的数据
@@ -570,7 +589,7 @@ func TestBuffer_WriteTo_Complex(t *testing.T) {
 	for i := 0; i < extraSize; i++ {
 		extraData[i] = byte('A' + (i % 26))
 	}
-	buf.Write(extraData)
+	wr.Write(extraData)
 
 	// 计算预期总数据
 	expectedData := append([]byte("56789"), extraData...)
@@ -613,8 +632,9 @@ var payload = [100]byte{}
 func BenchmarkBuffer_Write(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		buf := NewBuffer()
+		wr := buf.NewWriter()
 		for j := 0; j < 200; j++ {
-			_, _ = buf.Write(payload[:])
+			_, _ = wr.Write(payload[:])
 		}
 		buf.Free()
 	}
@@ -637,7 +657,9 @@ func BenchmarkCompare_WriteMethods(b *testing.B) {
 	}
 
 	buf := NewBuffer()
-	buf.Write(data)
+	wr := buf.NewWriter()
+
+	wr.Write(data)
 	dw := io.Discard
 
 	// 方案 1: 重构后的 WriteTo + bufio
@@ -745,6 +767,8 @@ func BenchmarkPoolContention(b *testing.B) {
 func TestBuffer_ShiftTo(t *testing.T) {
 	// 初始化 Buffer 并写入跨页数据 (Small + 1.5 Big Chunks)
 	b := NewBuffer()
+	wr := b.NewWriter()
+
 	p1 := make([]byte, SmallChunkSize) // 256B
 	p2 := make([]byte, ChunkSize)      // 4096B
 	p3 := make([]byte, 500)            // 500B
@@ -758,9 +782,9 @@ func TestBuffer_ShiftTo(t *testing.T) {
 		p3[i] = 'c'
 	}
 
-	b.Write(p1)
-	b.Write(p2)
-	b.Write(p3) // 总长度: 256 + 4096 + 500 = 4852
+	wr.Write(p1)
+	wr.Write(p2)
+	wr.Write(p3) // 总长度: 256 + 4096 + 500 = 4852
 
 	t.Run("ShiftSmall", func(t *testing.T) {
 		target := NewBuffer()
@@ -806,11 +830,13 @@ func TestBuffer_Discard(t *testing.T) {
 	// 为了确保测试覆盖 hasSmall=true 的场景，我们需要分两次写入
 	// 第一次写一个小数据占用 small，第二次写大数据触发 big
 	b := NewBuffer()
-	b.Write([]byte("init")) // 占用 small，此时 b.hasSmall 恒为 true
+	wr := b.NewWriter()
+
+	wr.Write([]byte("init")) // 占用 small，此时 b.hasSmall 恒为 true
 
 	// 构造后续的大页数据
 	data := make([]byte, SmallChunkSize+ChunkSize*2)
-	b.Write(data)
+	wr.Write(data)
 
 	require.True(t, b.hasSmall, "应该持有 small 页")
 
@@ -847,7 +873,9 @@ func TestBuffer_Discard(t *testing.T) {
 func TestBuffer_Discard2(t *testing.T) {
 	t.Run("DiscardWithinSmall", func(t *testing.T) {
 		b := NewBuffer()
-		b.Write([]byte("0123456789")) // 10字节，在small页
+		wr := b.NewWriter()
+
+		wr.Write([]byte("0123456789")) // 10字节，在small页
 		b.Discard(4)
 
 		require.Equal(t, 6, b.Len())
@@ -858,6 +886,8 @@ func TestBuffer_Discard2(t *testing.T) {
 
 	t.Run("DiscardCrossSmallToBig", func(t *testing.T) {
 		b := NewBuffer()
+		wr := b.NewWriter()
+
 		// 构造：Small(256B) + Big(4096B)
 		p1 := make([]byte, SmallChunkSize)
 		p2 := make([]byte, 100)
@@ -867,8 +897,8 @@ func TestBuffer_Discard2(t *testing.T) {
 		for i := range p2 {
 			p2[i] = 'b'
 		}
-		b.Write(p1)
-		b.Write(p2)
+		wr.Write(p1)
+		wr.Write(p2)
 
 		// 丢弃全部 Small + Big 的前 10 字节
 		b.Discard(SmallChunkSize + 10)
@@ -882,8 +912,10 @@ func TestBuffer_Discard2(t *testing.T) {
 	t.Run("DiscardBigOnlyMode", func(t *testing.T) {
 		// 模拟大对象直接禁用 small 的情况
 		b := NewBuffer()
+		wr := b.NewWriter()
+
 		payload := make([]byte, ChunkSize+500)
-		b.Write(payload) // 此时 b.hasSmall 应为 false
+		wr.Write(payload) // 此时 b.hasSmall 应为 false
 		require.False(t, b.hasSmall)
 
 		b.Discard(ChunkSize + 10)
@@ -896,11 +928,13 @@ func TestBuffer_Discard2(t *testing.T) {
 func TestBuffer_Discard_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
 	// 1. 构造 Big-only 模式 (首次写入 > 256B)
 	buf := NewBuffer()
+	wr := buf.NewWriter()
+
 	payload := make([]byte, ChunkSize+100)
 	for i := range payload {
 		payload[i] = byte(i % 256)
 	}
-	buf.Write(payload)
+	wr.Write(payload)
 	require.False(t, buf.hasSmall)
 
 	// 2. 丢弃到第一页大页的末尾，使得剩余数据 <= SmallChunkSize
@@ -921,10 +955,12 @@ func TestBuffer_Discard_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
 
 func TestBuffer_DataIntegrityAfterDiscard(t *testing.T) {
 	b := NewBuffer()
+	wr := b.NewWriter()
+
 	raw := []byte("0123456789")
 	// 循环写入使其跨页
 	for i := 0; i < 500; i++ {
-		b.Write(raw)
+		wr.Write(raw)
 	}
 
 	total := b.Bytes()
@@ -939,11 +975,13 @@ func TestBuffer_DataIntegrityAfterDiscard(t *testing.T) {
 func TestBuffer_ShiftTo_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
 	// 1. 构造 Big-only 模式
 	buf := NewBuffer()
+	wr := buf.NewWriter()
+
 	payload := make([]byte, ChunkSize+500) // 4096 + 500
 	for i := range payload {
 		payload[i] = byte(i % 256)
 	}
-	buf.Write(payload)
+	wr.Write(payload)
 	require.False(t, buf.hasSmall)
 
 	// 2. 将数据切分给 target，切分点选在第一页大页的末尾
@@ -973,7 +1011,9 @@ func TestBuffer_ShiftTo_BigOnly_RemainderSuffixFitsSmall(t *testing.T) {
 func TestBuffer_ShiftTo2(t *testing.T) {
 	t.Run("ShiftSmallToTarget", func(t *testing.T) {
 		b := NewBuffer()
-		b.Write([]byte("header_body")) // 11字节
+		wr := b.NewWriter()
+
+		wr.Write([]byte("header_body")) // 11字节
 
 		target := NewBuffer()
 		b.ShiftTo(6, target) // 切出 "header"
@@ -989,11 +1029,13 @@ func TestBuffer_ShiftTo2(t *testing.T) {
 	t.Run("ShiftBigSuffixToTarget", func(t *testing.T) {
 		// 构造 Big-Only 模式
 		b := NewBuffer()
+		wr := b.NewWriter()
+
 		payload := make([]byte, ChunkSize+200)
 		for i := range payload {
 			payload[i] = byte(i % 256)
 		}
-		b.Write(payload)
+		wr.Write(payload)
 
 		// 此时 b.hasSmall 为 false, 拥有 2 个 Big Chunk
 		require.False(t, b.hasSmall)
@@ -1013,7 +1055,9 @@ func TestBuffer_ShiftTo2(t *testing.T) {
 
 	t.Run("ShiftAllToTarget", func(t *testing.T) {
 		b := NewBuffer()
-		b.Write([]byte("full_data"))
+		wr := b.NewWriter()
+
+		wr.Write([]byte("full_data"))
 
 		target := NewBuffer()
 		b.ShiftTo(b.Len(), target)
@@ -1026,12 +1070,14 @@ func TestBuffer_ShiftTo2(t *testing.T) {
 
 func TestBuffer_ComplexOperations(t *testing.T) {
 	b := NewBuffer()
+	wr := b.NewWriter()
+
 	// 填充 10KB 数据
 	data := make([]byte, 10240)
 	for i := range data {
 		data[i] = byte(i % 256)
 	}
-	b.Write(data)
+	wr.Write(data)
 
 	// 1. 丢弃一部分
 	b.Discard(1000)
@@ -1050,19 +1096,20 @@ func TestBuffer_ComplexOperations(t *testing.T) {
 func TestShiftTo_Isolation(t *testing.T) {
 	// 1. 初始化环境：确保数据跨越 SmallChunk 並进入 BigChunk
 	b := NewBuffer() // 假設初始化函數
+	wr := b.NewWriter()
 
 	// 寫入足夠数据：1个 SmallChunk + 1个 BigChunk
 	data1 := make([]byte, SmallChunkSize)
 	for i := range data1 {
 		data1[i] = 'A'
 	}
-	b.Write(data1)
+	wr.Write(data1)
 
 	data2 := make([]byte, ChunkSize)
 	for i := range data2 {
 		data2[i] = 'B'
 	}
-	b.Write(data2)
+	wr.Write(data2)
 
 	// 当前布局：[AAAA... (Small)] [BBBB... (BigIdx 0)]
 	// 总长度：SmallChunkSize + ChunkSize

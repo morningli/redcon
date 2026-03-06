@@ -9,15 +9,18 @@ import (
 type Reader struct {
 	rd    *bufio.Reader
 	buf   *Buffer
+	wr    *BufferWriter
 	cmds  []*Request
 	marks []int //复用坐标切片，避免解析 Array 时申请内存
 }
 
 // NewReader returns a command reader which will read RESP or telnet commands.
 func NewReader(rd io.Reader) *Reader {
+	b := NewBuffer()
 	return &Reader{
 		rd:  bufio.NewReaderSize(rd, 32<<10),
-		buf: NewBuffer(),
+		buf: b,
+		wr:  b.NewWriter(),
 	}
 }
 
@@ -67,7 +70,7 @@ func (rd *Reader) readAndParseSlow(leftover *int) ([]*Request, error) {
 		}
 
 		// 物理读取：ReadBuffered 内部已优化为不返回 (0, nil)
-		n, err := rd.buf.ReadBuffered(rd.rd)
+		n, err := rd.wr.CopyBufferedTo(rd.rd)
 		if err != nil {
 			return nil, err
 		}
@@ -101,8 +104,8 @@ next:
 			goto done
 		}
 
-		count, ok := b.Slice(1, i-1).ParseInt()
-		if !ok || count <= 0 {
+		count, err := b.Slice(1, i-1).ParseInt()
+		if err != nil || count <= 0 {
 			return nil, errInvalidMultiBulkLength
 		}
 
@@ -122,8 +125,8 @@ next:
 				goto done
 			}
 
-			size, ok := b.Slice(si+1, bulkEnd-1).ParseInt()
-			if !ok || size < 0 {
+			size, err := b.Slice(si+1, bulkEnd-1).ParseInt()
+			if err != nil || size < 0 {
 				return nil, errInvalidBulkLength
 			}
 
@@ -144,6 +147,7 @@ next:
 		// 解析成功：打包 Request
 		cmd := NewRequest()
 		b.ShiftTo(curr, cmd.Raw) // 物理页引用转移
+		rd.wr.Sync()
 		cmd.Args = make([]BufferView, count)
 		for h := 0; h < len(rd.marks); h += 2 {
 			cmd.Args[h/2] = cmd.Raw.Slice(rd.marks[h], rd.marks[h+1])
@@ -186,6 +190,7 @@ next:
 
 		// 5. 移除已解析的行并尝试解析下一条
 		b.Discard(i + 1)
+		rd.wr.Sync()
 		if b.Len() > 0 {
 			goto next
 		}

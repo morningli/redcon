@@ -130,11 +130,15 @@ func TestReadCommands_MemoryReuse(t *testing.T) {
 	rd := NewReader(mock)
 
 	// 第一次解析
-	cmds1, _ := rd.readCommands(nil)
+	cmds1, err := rd.readCommands(nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(cmds1))
 	val1 := string(cmds1[0].Args[1].Bytes()) // 假设 BufferView 有 Bytes()
 
 	// 第二次解析
-	cmds2, _ := rd.readCommands(nil)
+	cmds2, err := rd.readCommands(nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(cmds1))
 	val2 := string(cmds2[0].Args[1].Bytes())
 
 	// 验证第二次解析没有破坏第一次解析出的内容（取决于你的 Raw 引用逻辑）
@@ -452,7 +456,7 @@ func TestReadCommands_PipelineAndPartial(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(cmds), "应该只解析出第一条 PING")
-	assert.Equal(t, 7, leftover, "应该剩下 '*1\r\n$4' 共 7 字节")
+	assert.Equal(t, 6, leftover, "应该剩下 '*1\r\n$4' 共 6 字节")
 }
 
 func TestReadCommands_PlainTextWhitespace(t *testing.T) {
