@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/morningli/mbuffer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -387,6 +388,8 @@ func TestDecodeStream_DeepArray(t *testing.T) {
 	}
 }
 
+var payload = [100]byte{}
+
 func BenchmarkRespond_ReadFrom(b *testing.B) {
 	buf := bytes.NewBuffer(nil)
 	buf.WriteString("*200\r\n")
@@ -480,7 +483,7 @@ func BenchmarkRespond_ReadUntilCRLF(b *testing.B) {
 func runBenchmarkReadUntil(b *testing.B, data []byte) {
 	// 1. 【关键】将对象初始化移出循环，模拟真实的 3w 连接池化场景
 	r := &Respond{
-		Buffer: NewBuffer(),
+		Buffer: mbuffer.NewBuffer(),
 	}
 	// 预分配一个足够大的 Reader 供复用
 	rd := bufio.NewReaderSize(nil, 16384)

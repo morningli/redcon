@@ -2,11 +2,12 @@ package redcon
 
 import (
 	"bytes"
+	"github.com/morningli/mbuffer"
 	"testing"
 )
 
 func TestAppendBulkFloat(t *testing.T) {
-	var buf = NewBuffer()
+	var buf = mbuffer.NewBuffer()
 	b := buf.NewWriter()
 
 	AppendString(b, "HELLO")
@@ -19,7 +20,7 @@ func TestAppendBulkFloat(t *testing.T) {
 }
 
 func TestAppendBulkInt(t *testing.T) {
-	var buf = NewBuffer()
+	var buf = mbuffer.NewBuffer()
 	b := buf.NewWriter()
 
 	AppendString(b, "HELLO")
@@ -32,7 +33,7 @@ func TestAppendBulkInt(t *testing.T) {
 }
 
 func TestAppendBulkUint(t *testing.T) {
-	var buf = NewBuffer()
+	var buf = mbuffer.NewBuffer()
 	b := buf.NewWriter()
 
 	AppendString(b, "HELLO")
@@ -45,7 +46,7 @@ func TestAppendBulkUint(t *testing.T) {
 }
 
 func TestAppendArray(t *testing.T) {
-	var buf = NewBuffer()
+	var buf = mbuffer.NewBuffer()
 	b := buf.NewWriter()
 
 	AppendArray(b, 1)
@@ -57,7 +58,7 @@ func TestAppendArray(t *testing.T) {
 }
 
 func TestAppendNullArray(t *testing.T) {
-	var buf = NewBuffer()
+	var buf = mbuffer.NewBuffer()
 	b := buf.NewWriter()
 
 	AppendNullArray(b)
@@ -88,7 +89,7 @@ func TestReadNextRESP_AllTypesAndStructures(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := NewBuffer()
+			b := mbuffer.NewBuffer()
 			wr := b.NewWriter()
 			_, _ = wr.Write([]byte(tt.raw))
 			view := b.Slice(0, b.Len())
@@ -125,7 +126,7 @@ func TestReadNextRESP_AllTypesAndStructures(t *testing.T) {
 func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 	t.Run("array_empty", func(t *testing.T) {
 		raw := "*0\r\n"
-		var buf = NewBuffer()
+		var buf = mbuffer.NewBuffer()
 		b := buf.NewWriter()
 
 		_, _ = b.Write([]byte(raw))
@@ -151,7 +152,7 @@ func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 
 	t.Run("array_null", func(t *testing.T) {
 		raw := "*-1\r\n"
-		var buf = NewBuffer()
+		var buf = mbuffer.NewBuffer()
 		b := buf.NewWriter()
 
 		_, _ = b.Write([]byte(raw))
@@ -177,7 +178,7 @@ func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 
 	t.Run("array_mixed_nested", func(t *testing.T) {
 		raw := "*4\r\n+OK\r\n:1\r\n$3\r\nbar\r\n*2\r\n:2\r\n$3\r\nbaz\r\n"
-		var buf = NewBuffer()
+		var buf = mbuffer.NewBuffer()
 		b := buf.NewWriter()
 
 		_, _ = b.Write([]byte(raw))
@@ -216,7 +217,7 @@ func TestReadNextRESP_ArrayVariantsAndNested(t *testing.T) {
 
 func TestRESP_MapAndMapGet(t *testing.T) {
 	raw := "*4\r\n$3\r\nfoo\r\n$3\r\nbar\r\n$3\r\nbaz\r\n$3\r\nqux\r\n"
-	var buf = NewBuffer()
+	var buf = mbuffer.NewBuffer()
 	b := buf.NewWriter()
 
 	_, _ = b.Write([]byte(raw))
@@ -248,7 +249,7 @@ func TestRESP_MapAndMapGet(t *testing.T) {
 
 func TestReadNextRESP_ConsumesOnlyOneMessage(t *testing.T) {
 	raw := "+OK\r\n:1\r\n"
-	var buf = NewBuffer()
+	var buf = mbuffer.NewBuffer()
 	b := buf.NewWriter()
 	_, _ = b.Write([]byte(raw))
 	view := buf.Slice(0, buf.Len())
@@ -271,7 +272,7 @@ func TestReadNextRESP_WithBytesBufferView(t *testing.T) {
 	// Ensure BufferView slicing works as expected when underlying data is contiguous.
 	raw := "$5\r\nHELLO\r\n"
 	buf := bytes.NewBufferString(raw)
-	b := NewBuffer()
+	b := mbuffer.NewBuffer()
 	wr := b.NewWriter()
 	_, _ = wr.Write(buf.Bytes())
 	view := b.Slice(0, b.Len())
@@ -282,7 +283,7 @@ func TestReadNextRESP_WithBytesBufferView(t *testing.T) {
 }
 
 func TestReadNextRESP_SimpleString_Structure(t *testing.T) {
-	b := NewBuffer()
+	b := mbuffer.NewBuffer()
 	wr := b.NewWriter()
 	_, _ = wr.Write([]byte("+OK\r\n"))
 	view := b.Slice(0, b.Len())
@@ -309,7 +310,7 @@ func TestReadNextRESP_SimpleString_Structure(t *testing.T) {
 }
 
 func TestReadNextRESP_Bulk_Structure(t *testing.T) {
-	b := NewBuffer()
+	b := mbuffer.NewBuffer()
 	wr := b.NewWriter()
 	_, _ = wr.Write([]byte("$3\r\nfoo\r\n"))
 	view := b.Slice(0, b.Len())
@@ -331,7 +332,7 @@ func TestReadNextRESP_Bulk_Structure(t *testing.T) {
 
 func TestReadNextRESP_ArrayNested_Structure(t *testing.T) {
 	raw := "*2\r\n*2\r\n:1\r\n:2\r\n$3\r\nbar\r\n"
-	b := NewBuffer()
+	b := mbuffer.NewBuffer()
 	wr := b.NewWriter()
 	_, _ = wr.Write([]byte(raw))
 	view := b.Slice(0, b.Len())

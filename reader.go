@@ -3,20 +3,22 @@ package redcon
 import (
 	"bufio"
 	"io"
+
+	"github.com/morningli/mbuffer"
 )
 
 // Reader represent a reader for RESP or telnet commands.
 type Reader struct {
 	rd    *bufio.Reader
-	buf   *Buffer
-	wr    *BufferWriter
+	buf   *mbuffer.Buffer
+	wr    *mbuffer.BufferWriter
 	cmds  []*Request
 	marks []int //复用坐标切片，避免解析 Array 时申请内存
 }
 
 // NewReader returns a command reader which will read RESP or telnet commands.
 func NewReader(rd io.Reader) *Reader {
-	b := NewBuffer()
+	b := mbuffer.NewBuffer()
 	return &Reader{
 		rd:  bufio.NewReaderSize(rd, 32<<10),
 		buf: b,
@@ -148,7 +150,7 @@ next:
 		cmd := NewRequest()
 		b.ShiftTo(curr, cmd.Raw) // 物理页引用转移
 		rd.wr.Sync()
-		cmd.Args = make([]BufferView, count)
+		cmd.Args = make([]mbuffer.BufferView, count)
 		for h := 0; h < len(rd.marks); h += 2 {
 			cmd.Args[h/2] = cmd.Raw.Slice(rd.marks[h], rd.marks[h+1])
 		}
@@ -165,7 +167,7 @@ next:
 		}
 
 		// 2. 截取当前行视图 (逻辑切片，0 拷贝)
-		var lineView BufferView
+		var lineView mbuffer.BufferView
 		if i > 0 && b.At(i-1) == '\r' {
 			lineView = b.Slice(0, i-1)
 		} else {
@@ -207,7 +209,7 @@ done:
 
 // parsePlainText 解析文本协议命令。
 // 虽然是不常用分支，但依然利用 BufferView 特性减少不必要的转换。
-func (rd *Reader) parsePlainText(line BufferView) ([][]byte, error) {
+func (rd *Reader) parsePlainText(line mbuffer.BufferView) ([][]byte, error) {
 	var args [][]byte
 	length := line.Len()
 	start := 0
@@ -251,7 +253,7 @@ func (rd *Reader) parsePlainText(line BufferView) ([][]byte, error) {
 // 使用 go:noinline 确保它不占用主解析路径的内联配额
 //
 //go:noinline
-func (rd *Reader) parseComplexQuote(line BufferView, start int) ([]byte, int, error) {
+func (rd *Reader) parseComplexQuote(line mbuffer.BufferView, start int) ([]byte, int, error) {
 	quotech := line.At(start)
 	length := line.Len()
 	var res []byte

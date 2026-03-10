@@ -2,6 +2,7 @@ package redcon
 
 import (
 	"fmt"
+	"github.com/morningli/mbuffer"
 	"reflect"
 	"sort"
 	"strconv"
@@ -23,8 +24,8 @@ const (
 // RESP 表示一次解析后的 RESP 消息结构。
 type RESP struct {
 	Type  Type
-	Raw   BufferView
-	Data  BufferView
+	Raw   mbuffer.BufferView
+	Data  mbuffer.BufferView
 	Array []RESP
 	Count int
 	Null  bool
@@ -115,7 +116,7 @@ func (r RESP) Exists() bool {
 
 // ReadNextRESP returns the next resp in b and returns the number of bytes the
 // took up the result.
-func ReadNextRESP(b BufferView) (n int, resp RESP) {
+func ReadNextRESP(b mbuffer.BufferView) (n int, resp RESP) {
 	if b.Len() == 0 {
 		return 0, RESP{} // no data to read
 	}
@@ -172,7 +173,7 @@ func ReadNextRESP(b BufferView) (n int, resp RESP) {
 			return 0, RESP{} // invalid number of bytes
 		}
 		if resp.Count < 0 {
-			resp.Data = BufferView{}
+			resp.Data = mbuffer.BufferView{}
 			resp.Null = true
 			resp.Count = 0
 			return resp.Raw.Len(), resp
@@ -431,7 +432,7 @@ func readTelnetCommand(packet []byte, argsbuf [][]byte) (
 }
 
 // appendPrefix will append a "$3\r\n" style redis prefix for a message.
-func appendPrefix(b *BufferWriter, c byte, n int64) {
+func appendPrefix(b *mbuffer.BufferWriter, c byte, n int64) {
 	if n >= 0 && n <= 9 {
 		_, _ = b.Write([]byte{c, byte('0' + n), '\r', '\n'})
 		return
@@ -442,55 +443,55 @@ func appendPrefix(b *BufferWriter, c byte, n int64) {
 }
 
 // AppendUint appends a Redis protocol uint64 to the input bytes.
-func AppendUint(b *BufferWriter, n uint64) {
+func AppendUint(b *mbuffer.BufferWriter, n uint64) {
 	_, _ = b.Write([]byte{':'})
 	_, _ = b.Write(strconv.AppendUint(nil, n, 10))
 	_, _ = b.Write([]byte{'\r', '\n'})
 }
 
 // AppendInt appends a Redis protocol int64 to the input bytes.
-func AppendInt(b *BufferWriter, n int64) {
+func AppendInt(b *mbuffer.BufferWriter, n int64) {
 	appendPrefix(b, ':', n)
 }
 
 // AppendArray appends a Redis protocol array to the input bytes.
-func AppendArray(b *BufferWriter, n int) {
+func AppendArray(b *mbuffer.BufferWriter, n int) {
 	appendPrefix(b, '*', int64(n))
 }
 
 // AppendNullArray appends a Redis protocol null array "*-1\r\n" to the input bytes.
-func AppendNullArray(b *BufferWriter) {
+func AppendNullArray(b *mbuffer.BufferWriter) {
 	_, _ = b.Write([]byte{'*', '-', '1', '\r', '\n'})
 }
 
 // AppendBulk appends a Redis protocol bulk byte slice to the input bytes.
-func AppendBulk(b *BufferWriter, bulk []byte) {
+func AppendBulk(b *mbuffer.BufferWriter, bulk []byte) {
 	appendPrefix(b, '$', int64(len(bulk)))
 	_, _ = b.Write(bulk)
 	_, _ = b.Write([]byte{'\r', '\n'})
 }
 
 // AppendBulkString appends a Redis protocol bulk string to the input bytes.
-func AppendBulkString(b *BufferWriter, bulk string) {
+func AppendBulkString(b *mbuffer.BufferWriter, bulk string) {
 	AppendBulk(b, []byte(bulk))
 }
 
 // AppendString appends a Redis protocol string to the input bytes.
-func AppendString(b *BufferWriter, s string) {
+func AppendString(b *mbuffer.BufferWriter, s string) {
 	_, _ = b.Write([]byte{'+'})
 	_, _ = b.Write([]byte(stripNewlines(s)))
 	_, _ = b.Write([]byte{'\r', '\n'})
 }
 
 // AppendError appends a Redis protocol error to the input bytes.
-func AppendError(b *BufferWriter, s string) {
+func AppendError(b *mbuffer.BufferWriter, s string) {
 	_, _ = b.Write([]byte{'-'})
 	_, _ = b.Write([]byte(stripNewlines(s)))
 	_, _ = b.Write([]byte{'\r', '\n'})
 }
 
 // AppendOK appends a Redis protocol OK to the input bytes.
-func AppendOK(b *BufferWriter) {
+func AppendOK(b *mbuffer.BufferWriter) {
 	_, _ = b.Write([]byte{'+', 'O', 'K', '\r', '\n'})
 }
 
@@ -506,7 +507,7 @@ func stripNewlines(s string) string {
 }
 
 // AppendTile38 appends a Tile38 message to the input bytes.
-func AppendTile38(b *BufferWriter, data []byte) {
+func AppendTile38(b *mbuffer.BufferWriter, data []byte) {
 	_, _ = b.Write([]byte{'$'})
 	_, _ = b.Write(strconv.AppendInt(nil, int64(len(data)), 10))
 	_, _ = b.Write([]byte{' '})
@@ -515,22 +516,22 @@ func AppendTile38(b *BufferWriter, data []byte) {
 }
 
 // AppendNull appends a Redis protocol null to the input bytes.
-func AppendNull(b *BufferWriter) {
+func AppendNull(b *mbuffer.BufferWriter) {
 	_, _ = b.Write([]byte{'$', '-', '1', '\r', '\n'})
 }
 
 // AppendBulkFloat appends a float64, as bulk bytes.
-func AppendBulkFloat(b *BufferWriter, f float64) {
+func AppendBulkFloat(b *mbuffer.BufferWriter, f float64) {
 	AppendBulk(b, strconv.AppendFloat(nil, f, 'f', -1, 64))
 }
 
 // AppendBulkInt appends an int64, as bulk bytes.
-func AppendBulkInt(b *BufferWriter, x int64) {
+func AppendBulkInt(b *mbuffer.BufferWriter, x int64) {
 	AppendBulk(b, strconv.AppendInt(nil, x, 10))
 }
 
 // AppendBulkUint appends an uint64, as bulk bytes.
-func AppendBulkUint(b *BufferWriter, x uint64) {
+func AppendBulkUint(b *mbuffer.BufferWriter, x uint64) {
 	AppendBulk(b, strconv.AppendUint(nil, x, 10))
 }
 
@@ -585,7 +586,7 @@ type Marshaler interface {
 //	SimpleInt       -> integer
 //	Marshaler       -> raw bytes
 //	everything-else -> bulk-string representation using fmt.Sprint()
-func AppendAny(b *BufferWriter, v interface{}) {
+func AppendAny(b *mbuffer.BufferWriter, v interface{}) {
 	switch v := v.(type) {
 	case SimpleString:
 		AppendString(b, string(v))

@@ -4,16 +4,18 @@ import (
 	"bufio"
 	"io"
 	"time"
+
+	"github.com/morningli/mbuffer"
 )
 
 // Request represent a command
 type Request struct {
 	ctx interface{}
 	// Raw is a encoded RESP message.
-	Raw *Buffer
-	wr  *BufferWriter
+	Raw *mbuffer.Buffer
+	wr  *mbuffer.BufferWriter
 	// Args is a series of arguments that make up the command.
-	Args []BufferView
+	Args []mbuffer.BufferView
 
 	ReceiveTime     time.Time
 	ProcessTime     time.Time
@@ -23,7 +25,7 @@ type Request struct {
 
 // NewRequest 创建一个空 Request，并初始化 Raw 缓冲区。
 func NewRequest() *Request {
-	b := NewBuffer()
+	b := mbuffer.NewBuffer()
 	return &Request{Raw: b, wr: b.NewWriter()}
 }
 
@@ -84,13 +86,13 @@ func Parse(raw []byte) (*Request, error) {
 
 // Respond allows for writing RESP messages.
 type Respond struct {
-	*Buffer
-	wr *BufferWriter
+	*mbuffer.Buffer
+	wr *mbuffer.BufferWriter
 }
 
 // NewRespond creates a new RESP writer.
 func NewRespond() *Respond {
-	b := NewBuffer()
+	b := mbuffer.NewBuffer()
 	return &Respond{Buffer: b, wr: b.NewWriter()}
 }
 
@@ -114,7 +116,7 @@ func (r *Respond) ReadFrom(rd *bufio.Reader) (int64, error) {
 
 // decodeStream 从 rd 中读取并解析一个完整的 RESP 报文。
 // 如果存在 Pipeline 粘包数据且 newBuf 不为 nil，则通过 Split 将多余数据切分给 newBuf。
-func (r *Respond) decodeStream(rd *bufio.Reader, newBuf *Buffer) (err error) {
+func (r *Respond) decodeStream(rd *bufio.Reader, newBuf *mbuffer.Buffer) (err error) {
 	// 始终从 Buffer 的逻辑起点开始探测第一个完整报文
 	const startOff = 0
 
@@ -262,7 +264,7 @@ func (r *Respond) parseLenInline(off *int) (int, error) {
 
 // CopyLineTo 从 rd 读取一行（直到 \r\n）并直接拷贝到写入器 w 中。
 // 返回该行在缓冲区中的视图。
-func (r *Respond) CopyLineTo(rd *bufio.Reader, w *BufferWriter) (BufferView, error) {
+func (r *Respond) CopyLineTo(rd *bufio.Reader, w *mbuffer.BufferWriter) (mbuffer.BufferView, error) {
 	// 记录起始逻辑位置，用于生成视图
 	start := r.Len()
 
@@ -281,7 +283,7 @@ func (r *Respond) CopyLineTo(rd *bufio.Reader, w *BufferWriter) (BufferView, err
 }
 
 //go:noinline
-func (r *Respond) copyLineToSlow(rd *bufio.Reader, w *BufferWriter, start int, line []byte, err error) (BufferView, error) {
+func (r *Respond) copyLineToSlow(rd *bufio.Reader, w *mbuffer.BufferWriter, start int, line []byte, err error) (mbuffer.BufferView, error) {
 	for {
 		if len(line) > 0 {
 			w.Write(line)
@@ -296,7 +298,7 @@ func (r *Respond) copyLineToSlow(rd *bufio.Reader, w *BufferWriter, start int, l
 			}
 		} else if err != bufio.ErrBufferFull {
 			// 遇到非缓冲区满的错误（如连接断开），直接返回
-			return BufferView{}, err
+			return mbuffer.BufferView{}, err
 		}
 
 		// 缓冲区满或未读到 \n，继续读取下一段
@@ -306,7 +308,7 @@ func (r *Respond) copyLineToSlow(rd *bufio.Reader, w *BufferWriter, start int, l
 
 // CopyLenTo 从 rd 读取 RESP 长度行（如 :10\r\n 或 $5\r\n），
 // 在拷贝到 w 的同时解析并返回其代表的整数值。
-func (r *Respond) CopyLenTo(rd *bufio.Reader, w *BufferWriter) (int, error) {
+func (r *Respond) CopyLenTo(rd *bufio.Reader, w *mbuffer.BufferWriter) (int, error) {
 	// 从 bufio 读取到行尾
 	line, err := rd.ReadSlice('\n')
 
@@ -339,7 +341,7 @@ func (r *Respond) CopyLenTo(rd *bufio.Reader, w *BufferWriter) (int, error) {
 }
 
 //go:noinline
-func (r *Respond) copyLenToSlow(rd *bufio.Reader, w *BufferWriter, line []byte, err error) (int, error) {
+func (r *Respond) copyLenToSlow(rd *bufio.Reader, w *mbuffer.BufferWriter, line []byte, err error) (int, error) {
 	var (
 		n          int
 		digitCount int
@@ -477,7 +479,7 @@ func (r *Respond) Swap(r_ *Respond) {
 
 func (r *Respond) Reset() {
 	r.Buffer.Free()
-	r.Buffer = NewBuffer()
+	r.Buffer = mbuffer.NewBuffer()
 	r.wr = r.Buffer.NewWriter()
 }
 
