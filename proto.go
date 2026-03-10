@@ -3,9 +3,21 @@ package redcon
 import (
 	"bufio"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/morningli/mbuffer"
+)
+
+var (
+	requestPool = sync.Pool{New: func() interface{} {
+		b := mbuffer.NewBuffer()
+		return &Request{Raw: b, wr: b.NewWriter()}
+	}}
+	respondPool = sync.Pool{New: func() interface{} {
+		b := mbuffer.NewBuffer()
+		return &Respond{Buffer: b, wr: b.NewWriter()}
+	}}
 )
 
 // Request represent a command
@@ -25,12 +37,25 @@ type Request struct {
 
 // NewRequest 创建一个空 Request，并初始化 Raw 缓冲区。
 func NewRequest() *Request {
-	b := mbuffer.NewBuffer()
-	return &Request{Raw: b, wr: b.NewWriter()}
+	r := requestPool.Get().(*Request)
+	r.Raw = mbuffer.NewBuffer()
+	r.wr = r.Raw.NewWriter()
+	return r
 }
 
 // Free 释放 Request 持有的 Raw 缓冲区。
-func (r *Request) Free() { r.Raw.Free() }
+func (r *Request) Free() {
+	r.ctx = nil
+	r.Raw.Free()
+	r.Raw = nil
+	r.wr = nil
+	r.Args = nil
+	r.ReceiveTime = time.Time{}
+	r.ProcessTime = time.Time{}
+	r.ProcessDoneTime = time.Time{}
+	r.FlushTime = time.Time{}
+	requestPool.Put(r)
+}
 
 // Context 返回与该请求关联的用户上下文。
 func (r *Request) Context() interface{} { return r.ctx }
@@ -92,8 +117,10 @@ type Respond struct {
 
 // NewRespond creates a new RESP writer.
 func NewRespond() *Respond {
-	b := mbuffer.NewBuffer()
-	return &Respond{Buffer: b, wr: b.NewWriter()}
+	r := respondPool.Get().(*Respond)
+	r.Buffer = mbuffer.NewBuffer()
+	r.wr = r.Buffer.NewWriter()
+	return r
 }
 
 // Data returns the unflushed buffer. This is a copy so changes
@@ -470,6 +497,9 @@ func (r *Respond) WriteAny(v interface{}) {
 
 func (r *Respond) Free() {
 	r.Buffer.Free()
+	r.Buffer = nil
+	r.wr = nil
+	respondPool.Put(r)
 }
 
 func (r *Respond) Swap(r_ *Respond) {

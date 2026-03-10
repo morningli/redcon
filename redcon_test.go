@@ -482,7 +482,7 @@ func TestConn_CloseWaitDraining(t *testing.T) {
 		}, nil, nil, nil)
 	go func() {
 		err := s.ListenAndServe()
-		t.Logf("server is quit:%s\n", err.Error())
+		t.Logf("server is quit:%v\n", err)
 	}()
 	time.AfterFunc(time.Second, func() {
 		err := s.Close()
