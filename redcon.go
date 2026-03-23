@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"github.com/morningli/mbuffer"
 	"io"
 	"net"
 	"sync"
@@ -44,6 +45,25 @@ type Conn interface {
 	Context() interface{}
 	// SetContext sets a user-defined context
 	SetContext(v interface{})
+	// Detach return a connection that is detached from the server.
+	// Useful for operations like PubSub.
+	//
+	//   dconn := conn.Detach()
+	//   go func(){
+	//       defer dconn.Close()
+	//       cmd, err := dconn.ReadCommand()
+	//       if err != nil{
+	//           fmt.Printf("read failed: %v\n", err)
+	//	         return
+	//       }
+	//       fmt.Printf("received command: %v", cmd)
+	//       hconn.WriteString("OK")
+	//       if err := dconn.Flush(); err != nil{
+	//           fmt.Printf("write failed: %v\n", err)
+	//	         return
+	//       }
+	//   }()
+	Detach() DetachedConn
 	// ReadPipeline returns all commands in current pipeline, if any
 	// The commands are removed from the pipeline.
 	ReadPipeline() []*Request
@@ -427,6 +447,66 @@ func (c *conn) PeekPipeline() []*Request {
 }
 func (c *conn) NetConn() net.Conn {
 	return c.conn
+}
+
+// DetachedConn represents a connection that is detached from the server
+type DetachedConn interface {
+	// Conn is the original connection
+	Conn
+	// ReadCommand reads the next client command.
+	ReadCommand() (*Request, error)
+	WriteRaw(*mbuffer.Buffer) (int64, error)
+	// Flush flushes any writes to the network.
+	Flush() error
+}
+
+// Detach removes the current connection from the server loop and returns
+// a detached connection. This is useful for operations such as PubSub.
+// The detached connection must be closed by calling Close() when done.
+// All writes such as WriteString() will not be written to the client
+// until Flush() is called.
+func (c *conn) Detach() DetachedConn {
+	c.detached = true
+	cmds := c.cmds
+	c.cmds = nil
+	return &detachedConn{conn: c, cmds: cmds}
+}
+
+type detachedConn struct {
+	*conn
+	cmds []*Request
+}
+
+// Flush writes and Write* calls to the client.
+func (dc *detachedConn) Flush() error {
+	return dc.conn.wr.Flush()
+}
+
+// ReadCommand read the next command from the client.
+func (dc *detachedConn) ReadCommand() (*Request, error) {
+	if len(dc.cmds) > 0 {
+		cmd := dc.cmds[0]
+		if len(dc.cmds) == 1 {
+			dc.cmds = nil
+		} else {
+			dc.cmds = dc.cmds[1:]
+		}
+		return cmd, nil
+	}
+	cmd, err := dc.rd.ReadCommand()
+	if err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+func (dc *detachedConn) WriteRaw(raw *mbuffer.Buffer) (int64, error) {
+	return raw.WriteTo(dc.wr)
+}
+
+func (dc *detachedConn) Close() error {
+	dc.needClose = true
+	return dc.close()
 }
 
 // Server defines a server for clients for managing client connections.
