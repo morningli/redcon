@@ -455,7 +455,10 @@ type DetachedConn interface {
 	Conn
 	// ReadCommand reads the next client command.
 	ReadCommand() (*Request, error)
-	WriteRaw(*mbuffer.Buffer) (int64, error)
+	Write(raw []byte) (int, error)
+	WriteBuffer(buff *mbuffer.Buffer) (int64, error)
+	WriteRequest(r *Request) (int64, error)
+	WriteRespond(r *Respond) (int64, error)
 	// Flush flushes any writes to the network.
 	Flush() error
 }
@@ -500,8 +503,20 @@ func (dc *detachedConn) ReadCommand() (*Request, error) {
 	return cmd, nil
 }
 
-func (dc *detachedConn) WriteRaw(raw *mbuffer.Buffer) (int64, error) {
-	return raw.WriteTo(dc.wr)
+func (dc *detachedConn) Write(raw []byte) (int, error) {
+	return dc.wr.Write(raw)
+}
+
+func (dc *detachedConn) WriteBuffer(buff *mbuffer.Buffer) (int64, error) {
+	return buff.WriteTo(dc.wr)
+}
+
+func (dc *detachedConn) WriteRequest(r *Request) (int64, error) {
+	return r.WriteTo(dc.wr)
+}
+
+func (dc *detachedConn) WriteRespond(r *Respond) (int64, error) {
+	return r.WriteTo(dc.wr)
 }
 
 func (dc *detachedConn) Close() error {
