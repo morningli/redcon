@@ -18,7 +18,7 @@ var (
 		b := mbuffer.NewBuffer()
 		return &Respond{Buffer: b, wr: b.NewWriter()}
 	}}
-	OK = "+OK\r\n"
+	OK = []byte{'+', 'O', 'K', '\r', '\n'}
 )
 
 // Request represent a command
