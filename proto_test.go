@@ -110,14 +110,9 @@ var (
 	ErrIllegalBytesInLength   error = errors.New("redis: ERR illegal bytes in length")
 )
 
-const (
-	OK   = "OK"
-	PONG = "PONG"
-)
-
 var (
-	OkReply   interface{} = OK
-	PongReply interface{} = PONG
+	OkReply   interface{} = "OK"
+	PongReply interface{} = "PONG"
 )
 
 type TestReader struct {

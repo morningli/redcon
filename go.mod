@@ -3,7 +3,7 @@ module github.com/tidwall/redcon
 go 1.19
 
 require (
-	github.com/morningli/mbuffer v0.0.0-20260311023828-25ba3e52e9f6
+	github.com/morningli/mbuffer v0.0.0-20260407102317-80e2e248e1d3
 	github.com/stretchr/testify v1.11.1
 )
 

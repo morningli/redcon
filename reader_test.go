@@ -3,6 +3,7 @@ package redcon
 import (
 	"bytes"
 	"io"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -468,4 +469,35 @@ func TestReadCommands_PlainTextWhitespace(t *testing.T) {
 	assert.Equal(t, 1, len(cmds))
 	// 验证 Args 长度应为 3 (SET, key, value)，而不是包含空格的垃圾
 	assert.Equal(t, 3, len(cmds[0].Args))
+}
+
+func GenerateFastBytes(size int) []byte {
+	b := make([]byte, size)
+	rand.Read(b) // Go 1.6+ 支持直接 Read 填充
+	return b
+}
+
+func TestReader_readCommands(t *testing.T) {
+	raw := bytes.NewBuffer(nil)
+	for i := 0; i < 10; i++ {
+		raw.Write([]byte("*4\r\n$4\r\nHSET\r\n$4\r\nkey0\r\n$6\r\nfield0\r\n$50\r\n"))
+		raw.Write(GenerateFastBytes(50))
+		raw.Write([]byte("\r\n"))
+		raw.Write([]byte("*4\r\n$4\r\nHSET\r\n$4\r\nkey0\r\n$6\r\nfield1\r\n$4000\r\n"))
+		raw.Write(GenerateFastBytes(4000))
+		raw.Write([]byte("\r\n"))
+		raw.Write([]byte("*3\r\n$6\r\nexpire\r\n$4\r\nkey0\r\n$8\r\n31536000\r\n"))
+	}
+	rd := NewReader(raw)
+	total := 0
+	for {
+		cmds, err := rd.readCommands(nil)
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		t.Logf("parsed %d commands", len(cmds))
+		total += len(cmds)
+	}
+	require.Equal(t, 30, total)
 }
