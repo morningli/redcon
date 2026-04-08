@@ -694,45 +694,73 @@ type strKeyItem struct {
 	value interface{}
 }
 
-// Encode: 将二进制 []byte 转换为 redis-cli 风格字符串 (不带首尾引号)
-func RedisEncode(data []byte) string {
-	var buf bytes.Buffer
-	for _, b := range data {
-		// 1. 处理特殊转义字符
-		switch b {
-		case '\\':
-			buf.WriteString(`\\`)
-		case '"':
-			buf.WriteString(`\"`)
-		case '\n':
-			buf.WriteString(`\n`)
-		case '\r':
-			buf.WriteString(`\r`)
-		case '\t':
-			buf.WriteString(`\t`)
-		case '\a':
-			buf.WriteString(`\a`)
-		case '\b':
-			buf.WriteString(`\b`)
-		default:
-			// 2. 可见字符原样输出 (ASCII 32-126)
-			if b >= 32 && b <= 126 {
-				buf.WriteByte(b)
-			} else {
-				// 3. 其他所有二进制数据转为 \xHH
-				buf.WriteString(fmt.Sprintf("\\x%02x", b))
-			}
+// RedisEncode : 将二进制 []byte 转换为 redis-cli 风格字符串 (不带首尾引号)
+func RedisEncode(data []byte) []byte {
+	// 1. 快速扫描，确定是否需要转码
+	firstIdx := -1
+	for i, b := range data {
+		if b < 32 || b > 126 || b == '\\' || b == '"' {
+			firstIdx = i
+			break
 		}
 	}
-	return buf.String()
+
+	// 2. 不需要转码则直接返回
+	if firstIdx == -1 {
+		return data
+	}
+
+	// 3. 需要转码，初始化缓冲区并拷贝已检查的部分
+	buf := bytes.NewBuffer(make([]byte, 0, len(data)+16))
+	buf.Write(data[:firstIdx])
+
+	// 4. 处理剩余部分，通过查表或简单的条件判断减少嵌套
+	for _, b := range data[firstIdx:] {
+		// 特殊转义处理
+		if b == '\\' {
+			buf.WriteString(`\\`)
+			continue
+		}
+		if b == '"' {
+			buf.WriteString(`\"`)
+			continue
+		}
+		if b == '\n' {
+			buf.WriteString(`\n`)
+			continue
+		}
+		if b == '\r' {
+			buf.WriteString(`\r`)
+			continue
+		}
+		if b == '\t' {
+			buf.WriteString(`\t`)
+			continue
+		}
+
+		// 可见字符处理
+		if b >= 32 && b <= 126 {
+			buf.WriteByte(b)
+			continue
+		}
+
+		// 二进制数据处理
+		fmt.Fprintf(buf, "\\x%02x", b)
+	}
+
+	return buf.Bytes()
 }
 
-// Decode: 将 redis-cli 风格字符串还原为原始二进制 []byte
-func RedisDecode(s string) ([]byte, error) {
-	// strconv.Unquote 要求字符串必须带双引号
-	// 我们手动加上引号，然后利用 Go 原生的 Unquote 逻辑进行反转义
-	quoted := `"` + s + `"`
-	res, err := strconv.Unquote(quoted)
+// RedisDecode : 将 redis-cli 风格字符串还原为原始二进制 []byte
+func RedisDecode(s []byte) ([]byte, error) {
+	if len(s) == 0 {
+		return []byte{}, nil
+	}
+	// 组合 ["内容"] 格式进行还原
+	quoted := append([]byte{'"'}, s...)
+	quoted = append(quoted, '"')
+
+	res, err := strconv.Unquote(string(quoted))
 	if err != nil {
 		return nil, err
 	}
