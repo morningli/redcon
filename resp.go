@@ -1,6 +1,7 @@
 package redcon
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/morningli/mbuffer"
 	"reflect"
@@ -691,4 +692,49 @@ func AppendAny(b *mbuffer.BufferWriter, v interface{}) {
 type strKeyItem struct {
 	key   string
 	value interface{}
+}
+
+// Encode: 将二进制 []byte 转换为 redis-cli 风格字符串 (不带首尾引号)
+func RedisEncode(data []byte) string {
+	var buf bytes.Buffer
+	for _, b := range data {
+		// 1. 处理特殊转义字符
+		switch b {
+		case '\\':
+			buf.WriteString(`\\`)
+		case '"':
+			buf.WriteString(`\"`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		case '\t':
+			buf.WriteString(`\t`)
+		case '\a':
+			buf.WriteString(`\a`)
+		case '\b':
+			buf.WriteString(`\b`)
+		default:
+			// 2. 可见字符原样输出 (ASCII 32-126)
+			if b >= 32 && b <= 126 {
+				buf.WriteByte(b)
+			} else {
+				// 3. 其他所有二进制数据转为 \xHH
+				buf.WriteString(fmt.Sprintf("\\x%02x", b))
+			}
+		}
+	}
+	return buf.String()
+}
+
+// Decode: 将 redis-cli 风格字符串还原为原始二进制 []byte
+func RedisDecode(s string) ([]byte, error) {
+	// strconv.Unquote 要求字符串必须带双引号
+	// 我们手动加上引号，然后利用 Go 原生的 Unquote 逻辑进行反转义
+	quoted := `"` + s + `"`
+	res, err := strconv.Unquote(quoted)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(res), nil
 }
